@@ -6,20 +6,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Compatibility for FetchContent deps with old cmake_minimum_required
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
-# Options
 option(KV_BUILD_BENCH "Build benchmarks" ON)
 option(KV_USE_IOURING "Enable io_uring backend" ON)
 
-# Find system liburing
 if(KV_USE_IOURING)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.15)
 endif()
 
-# doctest via FetchContent
 include(FetchContent)
 FetchContent_Declare(
   doctest
@@ -29,7 +25,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(doctest)
 
-# Main library (header-only for now, will grow)
 add_library(kv_core INTERFACE)
 target_include_directories(kv_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(kv_core INTERFACE cxx_std_23)
@@ -39,11 +34,15 @@ if(KV_USE_IOURING)
   target_compile_definitions(kv_core INTERFACE KV_HAS_IOURING=1)
 endif()
 
-# Main binary (placeholder)
 add_executable(kv_server src/main.cpp)
 target_link_libraries(kv_server PRIVATE kv_core)
 
-# Tests
+# Benchmark binary
+if(KV_BUILD_BENCH)
+  add_executable(kv_bench src/bench/bench_main.cpp)
+  target_link_libraries(kv_bench PRIVATE kv_core)
+endif()
+
 enable_testing()
 add_executable(kv_tests
   tests/test_main.cpp
@@ -53,6 +52,7 @@ add_executable(kv_tests
   tests/test_wal_recovery.cpp
   tests/test_crash_recovery.cpp
   tests/test_iouring.cpp
+  tests/test_backends.cpp
 )
 target_link_libraries(kv_tests PRIVATE kv_core doctest::doctest)
 

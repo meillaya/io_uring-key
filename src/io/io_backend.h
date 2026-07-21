@@ -120,7 +120,7 @@ public:
     [[nodiscard]] virtual bool SupportsRegisteredBuffers() const { return false; }
     [[nodiscard]] virtual bool SupportsFixedFiles() const { return false; }
 
-protected:
+public:
     // Synchronous execution of a single request (for default SubmitBatch).
     IOResult ExecuteSync(const IORequest& req) {
         IOResult res;
