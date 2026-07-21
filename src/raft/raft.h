@@ -202,13 +202,17 @@ public:
         return Status::OK();
     }
 
-    // Read a value (leader-only, linearizable via ReadIndex).
+    // Read a value (leader-only). Served directly from the leader's in-memory
+    // state machine under a leader-lease assumption: we do NOT run a ReadIndex
+    // heartbeat-confirm round before reading, so this is a leader-lease read,
+    // not a full linearizable read (documented as a limitation in the docs).
     std::optional<std::string> Read(const std::string& key) {
         std::lock_guard lock(mu_);
         if (state_ != RaftState::kLeader) return std::nullopt;
 
-        // Leader lease: we're the leader, so we can serve reads.
-        // In a full implementation, we'd confirm leadership via ReadIndex.
+        // Leader-lease read: we currently hold the leader state, so we serve the
+        // read locally. A full implementation would first confirm leadership via
+        // a ReadIndex heartbeat round; we intentionally do not (see docs).
         auto it = state_machine_.find(key);
         if (it != state_machine_.end()) return it->second;
         return std::nullopt;
@@ -241,6 +245,14 @@ public:
         leader_id_ = args.leader_id;
         last_heartbeat_ = std::chrono::steady_clock::now();
 
+        // Reject a snapshot that does not advance our snapshot base (never
+        // install an older/equal snapshot). The term bump + step-down above
+        // still apply; we only refuse to roll the state machine backwards.
+        if (args.last_included_index <= snapshot_.last_included_index) {
+            reply.term = current_term_;
+            return reply;  // success stays false
+        }
+
         // Install the snapshot: replace state machine + snapshot base.
         snapshot_.last_included_index = args.last_included_index;
         snapshot_.last_included_term = args.last_included_term;
@@ -266,16 +278,54 @@ public:
         return reply;
     }
 
-    [[nodiscard]] RaftState state() const { return state_; }
-    [[nodiscard]] uint64_t current_term() const { return current_term_; }
-    [[nodiscard]] std::string leader_id() const { return leader_id_; }
-    [[nodiscard]] bool is_leader() const { return state_ == RaftState::kLeader; }
-    [[nodiscard]] uint64_t commit_index() const { return commit_index_; }
-    [[nodiscard]] uint64_t last_applied() const { return last_applied_; }
+    // ---- Thread-safe accessors (G009) ------------------------------------
+    // Every reader of mu_-protected state takes the lock and returns a copy
+    // computed under it, so the Raft layer is TSan-clean (no torn std::string /
+    // std::map reads). mu_ is mutable so const accessors can lock it. None of
+    // these is called from code that already holds mu_ (no lock recursion).
+    [[nodiscard]] RaftState state() const {
+        std::lock_guard lock(mu_);
+        return state_;
+    }
+    [[nodiscard]] uint64_t current_term() const {
+        std::lock_guard lock(mu_);
+        return current_term_;
+    }
+    [[nodiscard]] std::string leader_id() const {
+        std::lock_guard lock(mu_);
+        return leader_id_;
+    }
+    [[nodiscard]] bool is_leader() const {
+        std::lock_guard lock(mu_);
+        return state_ == RaftState::kLeader;
+    }
+    [[nodiscard]] uint64_t commit_index() const {
+        std::lock_guard lock(mu_);
+        return commit_index_;
+    }
+    [[nodiscard]] uint64_t last_applied() const {
+        std::lock_guard lock(mu_);
+        return last_applied_;
+    }
     [[nodiscard]] uint64_t last_included_index() const {
+        std::lock_guard lock(mu_);
         return snapshot_.last_included_index;
     }
-    [[nodiscard]] size_t log_size() const { return log_.size(); }
+    [[nodiscard]] size_t log_size() const {
+        std::lock_guard lock(mu_);
+        return log_.size();
+    }
+    // Snapshot-aware last log position: falls back to the snapshot base when the
+    // log has been fully compacted away. These are the values the RequestVote
+    // up-to-date check must compare against.
+    [[nodiscard]] uint64_t last_log_index() const {
+        std::lock_guard lock(mu_);
+        return LastLogIndexLocked();
+    }
+    [[nodiscard]] uint64_t last_log_term() const {
+        std::lock_guard lock(mu_);
+        return LastLogTermLocked();
+    }
     // Copy of the materialized KV state machine (for tests/inspection).
     [[nodiscard]] std::map<std::string, std::string> state_machine_copy() const {
         std::lock_guard lock(mu_);
@@ -301,8 +351,8 @@ public:
         // Check if we can vote for this candidate.
         if (voted_for_.empty() || voted_for_ == args.candidate_id) {
             // Check log is at least as up-to-date.
-            uint64_t my_last_term = log_.empty() ? 0 : log_.back().term;
-            uint64_t my_last_index = log_.empty() ? 0 : log_.back().index;
+            uint64_t my_last_term = LastLogTermLocked();
+            uint64_t my_last_index = LastLogIndexLocked();
 
             if (args.last_log_term > my_last_term ||
                 (args.last_log_term == my_last_term &&
@@ -435,8 +485,8 @@ private:
         RequestVoteArgs args;
         args.term = current_term_;
         args.candidate_id = config_.node_id;
-        args.last_log_index = log_.empty() ? 0 : log_.back().index;
-        args.last_log_term = log_.empty() ? 0 : log_.back().term;
+        args.last_log_index = LastLogIndexLocked();
+        args.last_log_term = LastLogTermLocked();
 
         int votes = 1;  // Vote for self.
         int needed = static_cast<int>(config_.peers.size()) / 2 + 1;
@@ -737,6 +787,16 @@ private:
                     config_.node_id.c_str(), current_term_, commit_index_,
                     log_.size(), snapshot_.last_included_index);
         return Status::OK();
+    }
+
+    // Snapshot-aware last log position. When the log has been fully compacted
+    // (log_ empty but a snapshot present), the effective last entry is the
+    // snapshot's last_included_index/term, NOT (0,0). Caller holds mu_.
+    uint64_t LastLogIndexLocked() const {
+        return log_.empty() ? snapshot_.last_included_index : log_.back().index;
+    }
+    uint64_t LastLogTermLocked() const {
+        return log_.empty() ? snapshot_.last_included_term : log_.back().term;
     }
 
     // Term of the entry at `index`, consulting the snapshot base first.

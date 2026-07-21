@@ -7,9 +7,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -80,14 +82,18 @@ public:
 
     void Stop() {
         running_ = false;
-        if (listen_fd_ >= 0) {
-            ::shutdown(listen_fd_, SHUT_RDWR);
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        // Atomically take the listener fd so the accept loop cannot race on it,
+        // then shut it down to unblock accept().
+        int fd = listen_fd_.exchange(-1);
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
         }
         if (accept_thread_.joinable()) accept_thread_.join();
-        for (auto& t : client_threads_) {
-            if (t.joinable()) t.join();
+        // The accept loop owns client_threads_ while running; now that it is
+        // joined, join any handlers still live (finished ones were already reaped).
+        for (auto& c : client_threads_) {
+            if (c.th.joinable()) c.th.join();
         }
         client_threads_.clear();
     }
@@ -114,10 +120,27 @@ private:
             int opt = 1;
             ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-            client_threads_.emplace_back([this, client_fd] {
-                HandleClient(client_fd);
-            });
+            // Reap finished connection handlers so the thread list stays bounded
+            // by LIVE connections rather than every connection ever accepted.
+            ReapClients();
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            client_threads_.push_back(ClientConn{
+                std::thread([this, client_fd, done] {
+                    HandleClient(client_fd);
+                    done->store(true, std::memory_order_release);
+                }),
+                done});
         }
+    }
+
+    // Join and drop client handlers that have finished. Only the accept loop
+    // calls this while it owns client_threads_; Stop() touches the list only
+    // after joining the accept loop, so no extra lock is required here.
+    void ReapClients() {
+        for (auto& c : client_threads_) {
+            if (c.done->load(std::memory_order_acquire) && c.th.joinable()) c.th.join();
+        }
+        std::erase_if(client_threads_, [](const ClientConn& c) { return !c.th.joinable(); });
     }
 
     void HandleClient(int fd) {
@@ -203,10 +226,16 @@ private:
     Engine& engine_;
     CommandHandler handler_;
     ServerOptions opts_;
-    int listen_fd_;
-    bool running_;
+    std::atomic<int> listen_fd_;
+    std::atomic<bool> running_;
     std::thread accept_thread_;
-    std::vector<std::thread> client_threads_;
+    // A tracked client handler plus a flag it sets on completion so the accept
+    // loop can reap finished threads (list bounded by live connections).
+    struct ClientConn {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::vector<ClientConn> client_threads_;
 };
 
 } // namespace kv

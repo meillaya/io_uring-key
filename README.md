@@ -143,7 +143,7 @@ policy. The four backends differ ONLY in the I/O submission/completion path.
 
 ## Test Coverage
 
-64 ctest cases, all green (`ctest --test-dir build`). Highlights:
+66 ctest cases, all green (`ctest --test-dir build`). Highlights:
 
 | Category | Coverage |
 |----------|----------|
@@ -157,7 +157,7 @@ policy. The four backends differ ONLY in the I/O submission/completion path.
 | Server | **malformed RESP over a real socket never crashes the server** |
 | Engine features | **FLUSHDB/Clear, DBSIZE, compaction wiring, corruption detection** |
 | Concurrency | **readers vs flush memtable-swap soak (TSan-clean)** |
-| Raft | election, replication, leader-only reads, **persistent-log restart recovery, snapshot + restart, InstallSnapshot** |
+| Raft | election, replication, leader-only reads, **persistent-log restart recovery, snapshot + restart, InstallSnapshot + snapshot-base safety** (Raft layer TSan-clean) |
 | Raft TCP | **3-node localhost cluster: election, replication, failover over real TCP** |
 
 ## Module Layout

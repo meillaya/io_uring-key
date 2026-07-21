@@ -24,6 +24,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -227,24 +228,28 @@ public:
 
     void Stop() {
         if (!running_.exchange(false)) {
-            if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
+            // Already stopped (or never started): just ensure the listener is closed.
+            int fd = listen_fd_.exchange(-1);
+            if (fd >= 0) ::close(fd);
             return;
         }
-        if (listen_fd_ >= 0) {
-            ::shutdown(listen_fd_, SHUT_RDWR);
-            ::close(listen_fd_);
-            listen_fd_ = -1;
+        // Atomically take the listener fd so the accept loop cannot race on it,
+        // then shut it down to unblock accept().
+        int fd = listen_fd_.exchange(-1);
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+            ::close(fd);
         }
         if (accept_thread_.joinable()) accept_thread_.join();
         // Drain in-flight connection handlers (each is bounded by the socket
         // recv timeout, so this join is short).
-        std::vector<std::thread> conns;
+        std::vector<Conn> conns;
         {
             std::lock_guard lock(conn_mu_);
-            conns.swap(conn_threads_);
+            conns.swap(conns_);
         }
-        for (auto& t : conns) {
-            if (t.joinable()) t.join();
+        for (auto& c : conns) {
+            if (c.th.joinable()) c.th.join();
         }
     }
 
@@ -294,12 +299,27 @@ private:
                 continue;
             }
             // Handle each connection on its own thread so a slow peer cannot
-            // stall the accept loop. Threads are tracked and joined on Stop().
-            {
-                std::lock_guard lock(conn_mu_);
-                conn_threads_.emplace_back([this, fd] { HandleConn(fd); });
-            }
+            // stall the accept loop. Finished handlers are reaped on every accept
+            // so the thread list stays bounded by LIVE connections rather than
+            // growing with every RPC ever served.
+            std::lock_guard lock(conn_mu_);
+            ReapConnsLocked();
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            conns_.push_back(Conn{
+                std::thread([this, fd, done] {
+                    HandleConn(fd);
+                    done->store(true, std::memory_order_release);
+                }),
+                done});
         }
+    }
+
+    // Join and drop connection handlers that have finished. Caller holds conn_mu_.
+    void ReapConnsLocked() {
+        for (auto& c : conns_) {
+            if (c.done->load(std::memory_order_acquire) && c.th.joinable()) c.th.join();
+        }
+        std::erase_if(conns_, [](const Conn& c) { return !c.th.joinable(); });
     }
 
     void HandleConn(int fd) {
@@ -441,11 +461,17 @@ private:
 
     std::string host_;
     uint16_t port_;
-    int listen_fd_;
+    std::atomic<int> listen_fd_;
     std::atomic<bool> running_;
     std::thread accept_thread_;
     std::mutex conn_mu_;
-    std::vector<std::thread> conn_threads_;
+    // A tracked connection handler plus a flag it sets on completion so the
+    // accept loop can reap finished threads (list bounded by live connections).
+    struct Conn {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::vector<Conn> conns_;
 
     std::mutex mu_;
     std::map<std::string, PeerAddr> peers_;
