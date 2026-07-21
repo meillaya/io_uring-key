@@ -194,6 +194,13 @@ Stated plainly so the docs never overclaim:
   speaks real TCP over localhost and is tested with 3 in-process nodes
   (election, replication, failover). A separate multi-OS-process cluster binary
   / harness is future work.
+- **In-memory Raft test transport can ABBA-deadlock under load.** The
+  in-memory test transport invokes peer RPC handlers inline (synchronously,
+  on the caller's thread), so two nodes running concurrent elections can
+  ABBA-deadlock under heavy CPU load — a liveness flake in tests, not a
+  safety bug (term/vote rules are unaffected). The TCP transport is
+  structurally immune because it dispatches each inbound RPC on its own
+  thread.
 - **Raft reads are leader-lease-style, not full ReadIndex.** The leader serves
   reads from its state machine without a ReadIndex heartbeat-confirm round.
   Follower reads are out of scope.
