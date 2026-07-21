@@ -94,7 +94,7 @@ devenv shell   # or: nix develop
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 
-# Test (64 tests)
+# Test (66 tests)
 ctest --test-dir build --output-on-failure
 
 # Run server
@@ -198,9 +198,23 @@ Stated plainly so the docs never overclaim:
   reads from its state machine without a ReadIndex heartbeat-confirm round.
   Follower reads are out of scope.
 - **No dynamic Raft membership** (joint consensus) — stretch only.
+- **Raft persisted state is fsync-durable (file + directory).** `PersistState`
+  fsyncs the temp `raft_state.bin` before the atomic rename and fsyncs the
+  containing directory after, so `currentTerm`/`votedFor`/log/snapshot survive
+  power loss (closing the renamed-but-not-fsync'd double-vote window). Residual
+  caveat: this is only as durable as the underlying storage/filesystem honoring
+  `fsync` — a disk write-cache with barriers disabled, or a filesystem that
+  no-ops `fsync`, can still lose acknowledged writes. The engine's WAL/SSTable
+  durability is governed separately by the I/O backend's `sync_wal` policy.
 - **RESP `SET ... EX` TTL is parsed but not enforced** (no key expiry).
   **`SCAN` is a minimal stub** (returns cursor 0 + empty list). `SELECT` is a
   single-DB no-op.
+- **`SET ... NX`/`XX` is best-effort, not atomic.** The handler checks existence
+  (`GET`) then writes (`PUT`) as two separate engine calls with no cross-operation
+  lock, so concurrent conditional SETs on the same key can race (two clients may
+  both observe "absent" and both succeed). The engine exposes no atomic
+  put-if-absent / compare-and-set primitive to collapse this into one transactional
+  step; atomic conditional SET is future work.
 - **Production hardening** (TLS/auth/ACL, rate limiting, multi-tenancy) is out
   of scope.
 

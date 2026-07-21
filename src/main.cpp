@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -31,7 +32,22 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--data-dir" && i + 1 < argc) data_dir = argv[++i];
         else if (arg == "--host" && i + 1 < argc) host = argv[++i];
-        else if (arg == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        else if (arg == "--port" && i + 1 < argc) {
+            const std::string port_str = argv[++i];
+            try {
+                int parsed = std::stoi(port_str);
+                if (parsed < 0 || parsed > 65535) {
+                    std::fprintf(stderr, "Invalid --port '%s' (expected 0-65535)\n",
+                                 port_str.c_str());
+                    return 1;
+                }
+                port = static_cast<uint16_t>(parsed);
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --port '%s' (expected 0-65535)\n",
+                             port_str.c_str());
+                return 1;
+            }
+        }
         else if (arg == "--backend" && i + 1 < argc) backend_name = argv[++i];
     }
 

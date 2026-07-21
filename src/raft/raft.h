@@ -3,6 +3,7 @@
 // crash recovery, leader-only reads.
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -19,6 +20,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "util/crc32.h"
 #include "util/logging.h"
@@ -653,13 +657,55 @@ private:
         std::erase_if(log_, [index](const LogEntry& e) { return e.index >= index; });
     }
 
-    // ---- Persistence (G008) -------------------------------------------------
+    // ---- Persistence (G008, power-loss-durable via G010) --------------------
     // Persistent Raft state = currentTerm + votedFor + commitIndex + the log +
     // the latest snapshot. Serialized to <data_dir>/raft_state.bin with a
     // trailing CRC32C; written atomically via tmp+rename. Persistence is a
     // no-op when data_dir is empty (e.g. ephemeral in-memory test clusters).
+    //
+    // Durability (G010): the temp file is fsync'd before rename and the
+    // containing directory is fsync'd after rename, so votedFor/currentTerm/
+    // log/snapshot survive power loss. This closes the renamed-but-not-fsync'd
+    // window that could otherwise permit a double-vote or two leaders in one
+    // term after a crash.
 
     std::string StatePath() const { return config_.data_dir + "/raft_state.bin"; }
+
+    // ---- Durable-write helpers (G010 power-loss safety) ---------------------
+    // fsync a file by path (open fd, ::fsync, close) so its data + metadata
+    // reach stable storage. Used to make the just-written temp state file
+    // durable BEFORE renaming it into place.
+    static Status SyncFileNamed(const std::string& path) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            return Status::IOError("open for fsync: " + path + ": " +
+                                   std::strerror(errno));
+        }
+        int rc = ::fsync(fd);
+        int e = errno;
+        ::close(fd);
+        if (rc != 0) {
+            return Status::IOError("fsync: " + path + ": " + std::strerror(e));
+        }
+        return Status::OK();
+    }
+
+    // fsync a directory so a rename/unlink within it is durable across power
+    // loss (the directory-entry update itself must reach stable storage).
+    static Status SyncDir(const std::string& dir) {
+        int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+        if (fd < 0) {
+            return Status::IOError("open dir for fsync: " + dir + ": " +
+                                   std::strerror(errno));
+        }
+        int rc = ::fsync(fd);
+        int e = errno;
+        ::close(fd);
+        if (rc != 0) {
+            return Status::IOError("fsync dir: " + dir + ": " + std::strerror(e));
+        }
+        return Status::OK();
+    }
 
     Status PersistState() {
         if (config_.data_dir.empty()) return Status::OK();
@@ -704,9 +750,20 @@ private:
             f.flush();
             if (!f) return Status::IOError("write raft state");
         }
+        // (a) fsync the just-written temp file so its data + metadata reach
+        //     stable storage BEFORE the rename. Without this a power loss can
+        //     leave a renamed-but-empty/partial raft_state.bin, corrupting
+        //     votedFor/currentTerm and opening a double-vote / two-leaders-in-
+        //     one-term window.
+        auto fs = SyncFileNamed(tmp);
+        if (!fs.ok()) return fs;
         std::error_code ec;
         std::filesystem::rename(tmp, path, ec);
         if (ec) return Status::IOError("rename raft state: " + ec.message());
+        // (b) fsync the containing directory so the rename (the directory-entry
+        //     update) is itself durable across power loss.
+        auto ds = SyncDir(config_.data_dir);
+        if (!ds.ok()) return ds;
         return Status::OK();
     }
 
