@@ -1,6 +1,9 @@
 # Build
 build/
+build-verify/
+build-audit-*/
 build-tsan/
+*.o
 cmake-build-*/
 compile_commands.json
 
