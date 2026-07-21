@@ -3,6 +3,7 @@
 #ifdef KV_HAS_IOURING
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <random>
@@ -244,6 +245,49 @@ TEST_CASE("io_uring: buffered (non-O_DIRECT) mode") {
     char buf[16] = {};
     REQUIRE(backend->Read(fh, 0, buf, 5).ok());
     CHECK(std::string(buf, 5) == "short");
+
+    backend->Close(fh);
+    std::filesystem::remove_all(data_dir);
+}
+
+TEST_CASE("io_uring: registered-buffer read/write fast path") {
+    auto data_dir = MakeTempDir();
+    auto backend = std::make_unique<IOUringBackend>();
+    REQUIRE(backend->Init().ok());
+
+    KV_LOG_INFO("io_uring: sqpoll=%d registered_buffers=%d",
+                backend->sqpoll_enabled(), backend->SupportsRegisteredBuffers());
+
+    if (!backend->SupportsRegisteredBuffers() || backend->buffer_pool() == nullptr) {
+        KV_LOG_WARN("registered buffers unavailable; skipping fast-path test");
+        std::filesystem::remove_all(data_dir);
+        return;
+    }
+
+    auto* pool = backend->buffer_pool();
+    REQUIRE(pool->count() >= 2);
+    auto& wbuf = pool->at(0);
+    auto& rbuf = pool->at(1);
+    const size_t n = 4096;
+    REQUIRE(wbuf.capacity() >= n);
+    REQUIRE(rbuf.capacity() >= n);
+
+    // Fill the write buffer (a registered pool buffer) with a pattern.
+    for (size_t i = 0; i < n; i++) wbuf.data()[i] = static_cast<uint8_t>(i * 7 + 1);
+
+    std::string path = data_dir + "/regbuf.dat";
+    FileHandle fh;
+    REQUIRE(backend->Open(path, true, false, &fh).ok());
+
+    // Write from a registered buffer -> prep_write_fixed path.
+    REQUIRE(backend->Write(fh, 0, wbuf.data(), n).ok());
+    REQUIRE(backend->Sync(fh, false).ok());
+
+    // Read into a different registered buffer -> prep_read_fixed path.
+    std::memset(rbuf.data(), 0, n);
+    REQUIRE(backend->Read(fh, 0, rbuf.data(), n).ok());
+
+    CHECK(std::memcmp(wbuf.data(), rbuf.data(), n) == 0);
 
     backend->Close(fh);
     std::filesystem::remove_all(data_dir);

@@ -6,6 +6,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -17,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "util/crc32.h"
 #include "util/logging.h"
 #include "util/status.h"
 
@@ -71,6 +75,21 @@ struct AppendEntriesReply {
     uint64_t match_index;  // For fast backup.
 };
 
+// InstallSnapshot RPC (sent by leader to a follower that is behind the
+// leader's compacted log).
+struct InstallSnapshotArgs {
+    uint64_t term;
+    std::string leader_id;
+    uint64_t last_included_index;
+    uint64_t last_included_term;
+    std::map<std::string, std::string> data;  // Full state-machine snapshot.
+};
+
+struct InstallSnapshotReply {
+    uint64_t term;
+    bool success;
+};
+
 // Snapshot data.
 struct Snapshot {
     uint64_t last_included_index = 0;
@@ -88,6 +107,15 @@ public:
     virtual Status SendAppendEntries(const std::string& target,
                                       const AppendEntriesArgs& args,
                                       AppendEntriesReply* reply) = 0;
+
+    // Ship a snapshot to a lagging follower. Default: unsupported (a transport
+    // that does not implement it simply cannot fast-forward a far-behind peer).
+    virtual Status SendInstallSnapshot(const std::string& target,
+                                       const InstallSnapshotArgs& args,
+                                       InstallSnapshotReply* reply) {
+        (void)target; (void)args; (void)reply;
+        return Status::NotSupported("transport does not support InstallSnapshot");
+    }
 };
 
 // Raft configuration.
@@ -156,14 +184,18 @@ public:
         entry.is_delete = is_delete;
 
         log_.push_back(entry);
-        PersistState();
 
         // Replicate to peers (or self-commit for single node).
         if (config_.peers.size() == 1) {
-            // Single node: commit immediately.
+            // Single node: commit immediately, then persist log + commit index
+            // together so a restart replays every committed entry.
             commit_index_ = entry.index;
+            PersistState();
             ApplyCommitted();
         } else {
+            // Persist the new log entry before replicating; commit_index_ is
+            // persisted later once a majority acknowledges (UpdateCommitIndex).
+            PersistState();
             ReplicateToPeers();
         }
 
@@ -182,10 +214,73 @@ public:
         return std::nullopt;
     }
 
+    // Compact the applied log into a snapshot and truncate the log entries
+    // that are now covered by the snapshot. Persists the result. Returns the
+    // number of log entries dropped.
+    size_t TakeSnapshot() {
+        std::lock_guard lock(mu_);
+        return TakeSnapshotLocked();
+    }
+
+    // Handle an InstallSnapshot RPC from the leader (follower side).
+    InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotArgs& args) {
+        std::lock_guard lock(mu_);
+        InstallSnapshotReply reply;
+        reply.term = current_term_;
+        reply.success = false;
+
+        if (args.term < current_term_) {
+            reply.term = current_term_;
+            return reply;
+        }
+        if (args.term > current_term_) {
+            current_term_ = args.term;
+            voted_for_ = "";
+        }
+        state_ = RaftState::kFollower;
+        leader_id_ = args.leader_id;
+        last_heartbeat_ = std::chrono::steady_clock::now();
+
+        // Install the snapshot: replace state machine + snapshot base.
+        snapshot_.last_included_index = args.last_included_index;
+        snapshot_.last_included_term = args.last_included_term;
+        snapshot_.data = args.data;
+
+        // Discard any log entries covered by the snapshot.
+        std::erase_if(log_, [&](const LogEntry& e) {
+            return e.index <= args.last_included_index;
+        });
+
+        // The state machine now IS the snapshot.
+        state_machine_ = args.data;
+        last_applied_ = args.last_included_index;
+        if (commit_index_ < args.last_included_index) {
+            commit_index_ = args.last_included_index;
+        }
+
+        PersistState();
+        reply.term = current_term_;
+        reply.success = true;
+        KV_LOG_INFO("Node %s installed snapshot up to index %lu",
+                    config_.node_id.c_str(), args.last_included_index);
+        return reply;
+    }
+
     [[nodiscard]] RaftState state() const { return state_; }
     [[nodiscard]] uint64_t current_term() const { return current_term_; }
     [[nodiscard]] std::string leader_id() const { return leader_id_; }
     [[nodiscard]] bool is_leader() const { return state_ == RaftState::kLeader; }
+    [[nodiscard]] uint64_t commit_index() const { return commit_index_; }
+    [[nodiscard]] uint64_t last_applied() const { return last_applied_; }
+    [[nodiscard]] uint64_t last_included_index() const {
+        return snapshot_.last_included_index;
+    }
+    [[nodiscard]] size_t log_size() const { return log_.size(); }
+    // Copy of the materialized KV state machine (for tests/inspection).
+    [[nodiscard]] std::map<std::string, std::string> state_machine_copy() const {
+        std::lock_guard lock(mu_);
+        return state_machine_;
+    }
 
     // Handle incoming RPCs (called by transport).
     RequestVoteReply HandleRequestVote(const RequestVoteArgs& args) {
@@ -248,19 +343,26 @@ public:
         state_ = RaftState::kFollower;
         last_heartbeat_ = std::chrono::steady_clock::now();
 
-        // Check prev_log consistency.
+        // Check prev_log consistency (snapshot-aware).
         if (args.prev_log_index > 0) {
-            if (args.prev_log_index > (log_.empty() ? 0 : log_.back().index)) {
+            uint64_t last_idx = log_.empty() ? snapshot_.last_included_index
+                                             : log_.back().index;
+            if (args.prev_log_index > last_idx) {
                 reply.term = current_term_;
-                return reply;
+                return reply;  // follower is behind; leader will back up / snapshot
             }
-            // Find the entry at prev_log_index.
-            auto it = FindLogEntry(args.prev_log_index);
-            if (!it || it->term != args.prev_log_term) {
-                // Truncate conflicting entries.
-                TruncateLogFrom(args.prev_log_index);
-                reply.term = current_term_;
-                return reply;
+            if (args.prev_log_index == snapshot_.last_included_index) {
+                if (args.prev_log_term != snapshot_.last_included_term) {
+                    reply.term = current_term_;
+                    return reply;
+                }
+            } else {
+                auto it = FindLogEntry(args.prev_log_index);
+                if (!it || it->term != args.prev_log_term) {
+                    TruncateLogFrom(args.prev_log_index);
+                    reply.term = current_term_;
+                    return reply;
+                }
             }
         }
 
@@ -382,6 +484,32 @@ private:
         for (auto& peer : config_.peers) {
             if (peer == config_.node_id) continue;
 
+            // If the follower needs entries we have already compacted into a
+            // snapshot, ship the whole snapshot instead of AppendEntries.
+            if (snapshot_.last_included_index > 0 &&
+                next_index_[peer] <= snapshot_.last_included_index) {
+                InstallSnapshotArgs sargs;
+                sargs.term = current_term_;
+                sargs.leader_id = config_.node_id;
+                sargs.last_included_index = snapshot_.last_included_index;
+                sargs.last_included_term = snapshot_.last_included_term;
+                sargs.data = snapshot_.data;
+                InstallSnapshotReply sreply;
+                auto ss = transport_->SendInstallSnapshot(peer, sargs, &sreply);
+                if (ss.ok() && sreply.success) {
+                    next_index_[peer] = snapshot_.last_included_index + 1;
+                    match_index_[peer] = snapshot_.last_included_index;
+                    UpdateCommitIndex();
+                } else if (ss.ok() && sreply.term > current_term_) {
+                    current_term_ = sreply.term;
+                    state_ = RaftState::kFollower;
+                    voted_for_ = "";
+                    PersistState();
+                    return;
+                }
+                continue;  // resume normal AppendEntries next round
+            }
+
             AppendEntriesArgs args;
             args.term = current_term_;
             args.leader_id = config_.node_id;
@@ -389,9 +517,8 @@ private:
 
             uint64_t next_idx = next_index_[peer];
             if (next_idx > 1) {
-                auto prev = FindLogEntry(next_idx - 1);
                 args.prev_log_index = next_idx - 1;
-                args.prev_log_term = prev ? prev->term : 0;
+                args.prev_log_term = TermAtLocked(next_idx - 1);
             } else {
                 args.prev_log_index = 0;
                 args.prev_log_term = 0;
@@ -442,6 +569,7 @@ private:
                 auto entry = FindLogEntry(n);
                 if (entry && entry->term == current_term_) {
                     commit_index_ = n;
+                    PersistState();  // make the new commit index durable
                     ApplyCommitted();
                     break;
                 }
@@ -475,14 +603,168 @@ private:
         std::erase_if(log_, [index](const LogEntry& e) { return e.index >= index; });
     }
 
+    // ---- Persistence (G008) -------------------------------------------------
+    // Persistent Raft state = currentTerm + votedFor + commitIndex + the log +
+    // the latest snapshot. Serialized to <data_dir>/raft_state.bin with a
+    // trailing CRC32C; written atomically via tmp+rename. Persistence is a
+    // no-op when data_dir is empty (e.g. ephemeral in-memory test clusters).
+
+    std::string StatePath() const { return config_.data_dir + "/raft_state.bin"; }
+
     Status PersistState() {
-        // TODO: persist current_term, voted_for, log to disk.
+        if (config_.data_dir.empty()) return Status::OK();
+
+        std::string buf;
+        auto put_u64 = [&](uint64_t v) { buf.append(reinterpret_cast<char*>(&v), 8); };
+        auto put_u32 = [&](uint32_t v) { buf.append(reinterpret_cast<char*>(&v), 4); };
+        auto put_str = [&](const std::string& x) {
+            put_u32(static_cast<uint32_t>(x.size()));
+            buf.append(x);
+        };
+
+        buf.append("KVRAFT01", 8);
+        put_u64(current_term_);
+        put_u64(commit_index_);
+        put_str(voted_for_);
+        // Snapshot.
+        put_u64(snapshot_.last_included_index);
+        put_u64(snapshot_.last_included_term);
+        put_u32(static_cast<uint32_t>(snapshot_.data.size()));
+        for (auto& [k, v] : snapshot_.data) { put_str(k); put_str(v); }
+        // Log (entries with index > snapshot base).
+        put_u32(static_cast<uint32_t>(log_.size()));
+        for (auto& e : log_) {
+            put_u64(e.term);
+            put_u64(e.index);
+            buf.push_back(e.is_delete ? '\x01' : '\x00');
+            put_str(e.key);
+            put_str(e.value);
+        }
+
+        uint32_t crc = CRC32::Compute(
+            reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+        buf.append(reinterpret_cast<char*>(&crc), 4);
+
+        std::string path = StatePath();
+        std::string tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f) return Status::IOError("open raft state tmp: " + tmp);
+            f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+            f.flush();
+            if (!f) return Status::IOError("write raft state");
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) return Status::IOError("rename raft state: " + ec.message());
         return Status::OK();
     }
 
     Status LoadState() {
-        // TODO: load persistent state from disk.
+        if (config_.data_dir.empty()) return Status::OK();
+
+        std::string path = StatePath();
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return Status::OK();  // No prior state -> fresh start.
+
+        std::string buf((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+        f.close();
+        if (buf.size() < 12 || buf.compare(0, 8, "KVRAFT01") != 0) {
+            KV_LOG_WARN("raft state header invalid; starting fresh");
+            return Status::OK();
+        }
+        uint32_t stored = 0;
+        std::memcpy(&stored, buf.data() + buf.size() - 4, 4);
+        uint32_t computed = CRC32::Compute(
+            reinterpret_cast<const uint8_t*>(buf.data()), buf.size() - 4);
+        if (stored != computed) {
+            KV_LOG_WARN("raft state CRC mismatch; starting fresh");
+            return Status::OK();
+        }
+
+        size_t pos = 8;
+        auto get_u64 = [&]() -> uint64_t {
+            uint64_t v; std::memcpy(&v, buf.data() + pos, 8); pos += 8; return v;
+        };
+        auto get_u32 = [&]() -> uint32_t {
+            uint32_t v; std::memcpy(&v, buf.data() + pos, 4); pos += 4; return v;
+        };
+        auto get_str = [&]() -> std::string {
+            uint32_t n = get_u32();
+            std::string x(buf.data() + pos, n); pos += n; return x;
+        };
+
+        current_term_ = get_u64();
+        commit_index_ = get_u64();
+        voted_for_ = get_str();
+        snapshot_.last_included_index = get_u64();
+        snapshot_.last_included_term = get_u64();
+        uint32_t nsnap = get_u32();
+        snapshot_.data.clear();
+        for (uint32_t i = 0; i < nsnap; i++) {
+            std::string k = get_str();
+            std::string v = get_str();
+            snapshot_.data[k] = v;
+        }
+        uint32_t nlog = get_u32();
+        log_.clear();
+        for (uint32_t i = 0; i < nlog; i++) {
+            LogEntry e;
+            e.term = get_u64();
+            e.index = get_u64();
+            e.is_delete = (buf[pos++] != 0);
+            e.key = get_str();
+            e.value = get_str();
+            log_.push_back(std::move(e));
+        }
+
+        // Rebuild the materialized state machine from snapshot + committed log,
+        // replaying committed entries through the apply callback so an external
+        // engine can reconstruct its state after a restart.
+        state_machine_ = snapshot_.data;
+        last_applied_ = snapshot_.last_included_index;
+        for (auto& e : log_) {
+            if (e.index <= last_applied_) continue;
+            if (e.index > commit_index_) break;  // only committed entries
+            if (e.is_delete) state_machine_.erase(e.key);
+            else state_machine_[e.key] = e.value;
+            if (apply_cb_) apply_cb_(e);
+            last_applied_ = e.index;
+        }
+
+        KV_LOG_INFO("Node %s recovered raft state: term=%lu commit=%lu log=%zu snap_index=%lu",
+                    config_.node_id.c_str(), current_term_, commit_index_,
+                    log_.size(), snapshot_.last_included_index);
         return Status::OK();
+    }
+
+    // Term of the entry at `index`, consulting the snapshot base first.
+    uint64_t TermAtLocked(uint64_t index) const {
+        if (index == 0) return 0;
+        if (index == snapshot_.last_included_index) return snapshot_.last_included_term;
+        for (auto& e : log_) {
+            if (e.index == index) return e.term;
+        }
+        return 0;
+    }
+
+    // Compact applied log into the snapshot. Caller holds mu_.
+    size_t TakeSnapshotLocked() {
+        if (last_applied_ == 0) return 0;
+        if (last_applied_ == snapshot_.last_included_index) return 0;
+        snapshot_.last_included_term = TermAtLocked(last_applied_);
+        snapshot_.last_included_index = last_applied_;
+        snapshot_.data = state_machine_;
+        size_t before = log_.size();
+        std::erase_if(log_, [&](const LogEntry& e) {
+            return e.index <= snapshot_.last_included_index;
+        });
+        size_t dropped = before - log_.size();
+        PersistState();
+        KV_LOG_INFO("Node %s took snapshot at index %lu (dropped %zu log entries)",
+                    config_.node_id.c_str(), snapshot_.last_included_index, dropped);
+        return dropped;
     }
 
     RaftConfig config_;
@@ -502,10 +784,11 @@ private:
     std::map<std::string, uint64_t> next_index_;
     std::map<std::string, uint64_t> match_index_;
     std::map<std::string, std::string> state_machine_;
+    Snapshot snapshot_;  // Compacted log base + materialized state.
 
     std::chrono::steady_clock::time_point last_heartbeat_;
     std::atomic<bool> running_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     std::thread raft_thread_;
 };
@@ -515,10 +798,17 @@ class InMemoryTransport final : public RaftTransport {
 public:
     using VoteHandler = std::function<RequestVoteReply(const RequestVoteArgs&)>;
     using AppendHandler = std::function<AppendEntriesReply(const AppendEntriesArgs&)>;
+    using SnapshotHandler = std::function<InstallSnapshotReply(const InstallSnapshotArgs&)>;
 
     void RegisterNode(const std::string& id, VoteHandler vote, AppendHandler append) {
         vote_handlers_[id] = std::move(vote);
         append_handlers_[id] = std::move(append);
+    }
+
+    void RegisterNode(const std::string& id, VoteHandler vote, AppendHandler append,
+                      SnapshotHandler snap) {
+        RegisterNode(id, std::move(vote), std::move(append));
+        snapshot_handlers_[id] = std::move(snap);
     }
 
     Status SendRequestVote(const std::string& target,
@@ -539,6 +829,15 @@ public:
         return Status::OK();
     }
 
+    Status SendInstallSnapshot(const std::string& target,
+                               const InstallSnapshotArgs& args,
+                               InstallSnapshotReply* reply) override {
+        auto it = snapshot_handlers_.find(target);
+        if (it == snapshot_handlers_.end()) return Status::IOError("node not found");
+        *reply = it->second(args);
+        return Status::OK();
+    }
+
     // Simulate network partition.
     void Partition(const std::string& node_id) { partitioned_.insert(node_id); }
     void Heal(const std::string& node_id) { partitioned_.erase(node_id); }
@@ -546,6 +845,7 @@ public:
 private:
     std::map<std::string, VoteHandler> vote_handlers_;
     std::map<std::string, AppendHandler> append_handlers_;
+    std::map<std::string, SnapshotHandler> snapshot_handlers_;
     std::set<std::string> partitioned_;
 };
 

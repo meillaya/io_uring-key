@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -380,10 +382,21 @@ public:
         if (fh_ != kInvalidFile) backend_->Close(fh_);
     }
 
-    // Point lookup. Returns nullopt if not found.
-    // Sets *is_tombstone if the key was deleted.
-    std::optional<std::string> Get(std::string_view key, bool* is_tombstone = nullptr) const {
-        if (!bloom_.MayContain(key)) return std::nullopt;
+    // Point lookup (G008: surfaces corruption instead of masking it as NotFound).
+    //
+    // On success returns Status::OK() and sets *out:
+    //   - *out has a value          -> key found (live value)
+    //   - *out is nullopt, tombstone -> key is a tombstone (deleted)
+    //   - *out is nullopt            -> key not present in this SSTable
+    // On a read error returns Status::IOError; on a CRC mismatch returns
+    // Status::Corruption. Callers MUST check the status before treating a
+    // nullopt *out as "not found".
+    Status Get(std::string_view key, std::optional<std::string>* out,
+               bool* is_tombstone = nullptr) const {
+        if (out) out->reset();
+        if (is_tombstone) *is_tombstone = false;
+
+        if (!bloom_.MayContain(key)) return Status::OK();  // definitely absent
 
         // Binary search in index for the block that might contain the key.
         int lo = 0, hi = static_cast<int>(index_.size()) - 1;
@@ -397,20 +410,29 @@ public:
                 lo = mid + 1;
             }
         }
-        if (target < 0) return std::nullopt;
+        if (target < 0) return Status::OK();  // absent
 
         // Read the block.
         auto& [last_key, block_offset, block_size] = index_[target];
         std::vector<uint8_t> block_data(block_size);
         auto s = backend_->Read(fh_, block_offset, block_data.data(), block_size);
-        if (!s.ok()) return std::nullopt;
+        if (!s.ok()) {
+            return Status::Corruption("block read failed for key '" +
+                                      std::string(key) + "': " + s.ToString());
+        }
 
         // Verify block CRC.
-        if (block_data.size() < 4) return std::nullopt;
+        if (block_data.size() < 4) {
+            return Status::Corruption("block too small");
+        }
         uint32_t stored_crc;
         std::memcpy(&stored_crc, block_data.data() + block_data.size() - 4, 4);
         uint32_t computed_crc = CRC32::Compute(block_data.data(), block_data.size() - 4);
-        if (stored_crc != computed_crc) return std::nullopt;
+        if (stored_crc != computed_crc) {
+            return Status::Corruption("block CRC mismatch (stored=" +
+                                      std::to_string(stored_crc) + " computed=" +
+                                      std::to_string(computed_crc) + ")");
+        }
 
         // Scan entries in block.
         uint32_t num_entries;
@@ -432,12 +454,15 @@ public:
 
             if (k == key) {
                 if (is_tombstone) *is_tombstone = tomb;
-                if (tomb) return std::nullopt;
-                return std::string(reinterpret_cast<const char*>(block_data.data() + pos), vlen);
+                if (tomb) return Status::OK();  // *out stays nullopt
+                if (out) {
+                    out->emplace(reinterpret_cast<const char*>(block_data.data() + pos), vlen);
+                }
+                return Status::OK();
             }
             pos += vlen;
         }
-        return std::nullopt;
+        return Status::OK();  // not present in this block
     }
 
     // Iterate all entries in the SSTable.

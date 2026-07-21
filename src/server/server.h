@@ -61,6 +61,16 @@ public:
             return Status::IOError(std::string("listen: ") + std::strerror(errno));
         }
 
+        // If the caller requested an ephemeral port (0), capture the actual
+        // port assigned by the OS so tests/clients can connect to it.
+        if (opts_.port == 0) {
+            struct sockaddr_in bound{};
+            socklen_t blen = sizeof(bound);
+            if (::getsockname(listen_fd_, reinterpret_cast<struct sockaddr*>(&bound), &blen) == 0) {
+                opts_.port = ntohs(bound.sin_port);
+            }
+        }
+
         running_ = true;
         KV_LOG_INFO("Server listening on %s:%d", opts_.host.c_str(), opts_.port);
 
@@ -83,6 +93,7 @@ public:
     }
 
     [[nodiscard]] uint16_t port() const { return opts_.port; }
+    [[nodiscard]] uint16_t bound_port() const { return opts_.port; }
     [[nodiscard]] bool running() const { return running_; }
 
 private:
@@ -113,39 +124,80 @@ private:
         std::string buffer;
         char recv_buf[65536];
 
-        while (running_) {
-            ssize_t n = ::recv(fd, recv_buf, sizeof(recv_buf), 0);
-            if (n <= 0) break;
+        // Defense in depth (G008): no exception may escape the connection loop.
+        // Any throw (parse, alloc, dispatch) is converted into a RESP -ERR reply
+        // so a malformed/huge request can never SIGABRT the process.
+        try {
+            while (running_) {
+                ssize_t n = ::recv(fd, recv_buf, sizeof(recv_buf), 0);
+                if (n <= 0) break;
 
-            buffer.append(recv_buf, static_cast<size_t>(n));
+                buffer.append(recv_buf, static_cast<size_t>(n));
 
-            // Process all complete commands in the buffer.
-            while (true) {
-                auto result = RespParser::ParseCommand(buffer);
-                if (!result.has_value()) break;
+                // Process all complete commands in the buffer.
+                while (true) {
+                    ParsedCommand parsed;
+                    try {
+                        parsed = RespParser::ParseCommandSafe(buffer);
+                    } catch (const std::exception& e) {
+                        SendError(fd, std::string("ERR internal error: ") + e.what());
+                        ::close(fd);
+                        return;
+                    }
 
-                auto& [args, consumed] = *result;
-                buffer.erase(0, consumed);
+                    if (parsed.status == ParseStatus::kIncomplete) break;  // need more bytes
 
-                RespValue response;
-                if (args.empty()) {
-                    response = RespValue::Error("ERR empty command");
-                } else {
-                    response = handler_.Execute(args);
-                }
+                    if (parsed.status == ParseStatus::kError) {
+                        // Malformed protocol input: reply with an error and drop
+                        // the connection (matches Redis behavior). The server
+                        // itself keeps running.
+                        SendError(fd, "ERR protocol error: " + parsed.error);
+                        ::close(fd);
+                        return;
+                    }
 
-                std::string serialized = RespSerializer::Serialize(response);
-                size_t sent = 0;
-                while (sent < serialized.size()) {
-                    ssize_t w = ::send(fd, serialized.data() + sent,
-                                       serialized.size() - sent, MSG_NOSIGNAL);
-                    if (w <= 0) break;
-                    sent += static_cast<size_t>(w);
+                    buffer.erase(0, parsed.consumed);
+
+                    RespValue response;
+                    try {
+                        if (parsed.args.empty()) {
+                            response = RespValue::Error("ERR empty command");
+                        } else {
+                            response = handler_.Execute(parsed.args);
+                        }
+                    } catch (const std::exception& e) {
+                        response = RespValue::Error(std::string("ERR ") + e.what());
+                    } catch (...) {
+                        response = RespValue::Error("ERR internal error");
+                    }
+
+                    if (!SendValue(fd, response)) break;
                 }
             }
+        } catch (const std::exception& e) {
+            KV_LOG_ERROR("connection error: %s", e.what());
+        } catch (...) {
+            KV_LOG_ERROR("connection error: unknown");
         }
 
         ::close(fd);
+    }
+
+    // Serialize and fully send a RESP value. Returns false on socket failure.
+    bool SendValue(int fd, const RespValue& response) {
+        std::string serialized = RespSerializer::Serialize(response);
+        size_t sent = 0;
+        while (sent < serialized.size()) {
+            ssize_t w = ::send(fd, serialized.data() + sent,
+                               serialized.size() - sent, MSG_NOSIGNAL);
+            if (w <= 0) return false;
+            sent += static_cast<size_t>(w);
+        }
+        return true;
+    }
+
+    void SendError(int fd, const std::string& msg) {
+        SendValue(fd, RespValue::Error(msg));
     }
 
     Engine& engine_;

@@ -93,3 +93,60 @@ TEST_CASE("RESP: roundtrip") {
     auto serialized = RespSerializer::Serialize(parsed->first);
     CHECK(serialized == input);
 }
+
+// ---------------------------------------------------------------------------
+// G008 hardening: malformed input must be reported as kError, never throw.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("RESP safe: malformed integer is an error, not a crash") {
+    auto r = RespParser::ParseCommandSafe(":notanumber\r\n");
+    CHECK(r.status == ParseStatus::kError);
+}
+
+TEST_CASE("RESP safe: oversized bulk length is an error") {
+    // 999999999999 exceeds kMaxBulkLen -> protocol error (no bad_alloc).
+    auto r = RespParser::ParseCommandSafe("$999999999999\r\n");
+    CHECK(r.status == ParseStatus::kError);
+}
+
+TEST_CASE("RESP safe: huge array count cannot trigger bad_alloc") {
+    // A bogus huge count with no elements must be an error or incomplete,
+    // and must NOT allocate ~count elements.
+    auto r = RespParser::ParseCommandSafe("*999999999999\r\n");
+    CHECK((r.status == ParseStatus::kError || r.status == ParseStatus::kIncomplete));
+}
+
+TEST_CASE("RESP safe: array count over limit is an error") {
+    auto r = RespParser::ParseCommandSafe("*2000000\r\n");
+    CHECK(r.status == ParseStatus::kError);
+}
+
+TEST_CASE("RESP safe: garbage type byte is an error") {
+    auto r = RespParser::ParseCommandSafe("%garbage\r\n");
+    CHECK(r.status == ParseStatus::kError);
+}
+
+TEST_CASE("RESP safe: incomplete input stays incomplete") {
+    auto r = RespParser::ParseCommandSafe("*2\r\n$3\r\nGET\r\n");
+    CHECK(r.status == ParseStatus::kIncomplete);
+}
+
+TEST_CASE("RESP safe: valid command parses ok") {
+    auto r = RespParser::ParseCommandSafe("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    REQUIRE(r.status == ParseStatus::kOk);
+    REQUIRE(r.args.size() == 3);
+    CHECK(r.args[0] == "SET");
+    CHECK(r.consumed == std::string("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").size());
+}
+
+TEST_CASE("RESP safe: legacy Parse never throws on garbage") {
+    // Legacy API maps malformed -> nullopt (must not throw).
+    CHECK(!RespParser::Parse(":xyz\r\n").has_value());
+    CHECK(!RespParser::Parse("$abc\r\n").has_value());
+    CHECK(!RespParser::Parse("@@@\r\n").has_value());
+}
+
+TEST_CASE("RESP safe: integer overflow is an error") {
+    auto r = RespParser::ParseCommandSafe(":99999999999999999999999999\r\n");
+    CHECK(r.status == ParseStatus::kError);
+}

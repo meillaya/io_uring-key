@@ -195,3 +195,200 @@ TEST_CASE("raft: leader-only reads") {
 
     node.Stop();
 }
+
+// ---------------------------------------------------------------------------
+// G008: persistent Raft log + snapshots + restart recovery.
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+#include <filesystem>
+#include <map>
+
+namespace {
+std::string MakeRaftTempDir() {
+    char tmpl[] = "/tmp/kv_raft_test_XXXXXX";
+    char* dir = mkdtemp(tmpl);
+    REQUIRE(dir != nullptr);
+    return std::string(dir);
+}
+} // namespace
+
+TEST_CASE("raft: persistent log recovers state after restart") {
+    auto dir = MakeRaftTempDir();
+
+    // Phase 1: run a single-node cluster, commit some entries, stop.
+    {
+        InMemoryTransport transport;
+        RaftConfig config;
+        config.node_id = "node1";
+        config.peers = {"node1"};
+        config.data_dir = dir;
+        config.election_timeout_min_ms = 50;
+        config.election_timeout_max_ms = 100;
+
+        RaftNode node(config, &transport, nullptr);
+        transport.RegisterNode("node1",
+            [&](const RequestVoteArgs& a) { return node.HandleRequestVote(a); },
+            [&](const AppendEntriesArgs& a) { return node.HandleAppendEntries(a); });
+        REQUIRE(node.Start().ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        REQUIRE(node.is_leader());
+
+        for (int i = 0; i < 5; i++) {
+            REQUIRE(node.Propose("k" + std::to_string(i), "v" + std::to_string(i)).ok());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(node.Read("k0").has_value());
+        node.Stop();
+    }
+
+    // Phase 2: restart a fresh node on the SAME data dir; it must recover the
+    // committed state by replaying the persisted log through the apply callback.
+    {
+        InMemoryTransport transport;
+        RaftConfig config;
+        config.node_id = "node1";
+        config.peers = {"node1"};
+        config.data_dir = dir;
+        config.election_timeout_min_ms = 50;
+        config.election_timeout_max_ms = 100;
+
+        std::map<std::string, std::string> replayed;
+        RaftNode node(config, &transport, [&](const LogEntry& e) {
+            if (e.is_delete) replayed.erase(e.key);
+            else replayed[e.key] = e.value;
+        });
+        transport.RegisterNode("node1",
+            [&](const RequestVoteArgs& a) { return node.HandleRequestVote(a); },
+            [&](const AppendEntriesArgs& a) { return node.HandleAppendEntries(a); });
+        REQUIRE(node.Start().ok());
+
+        // Recovery replayed the committed log through the apply callback.
+        CHECK(replayed.size() == 5);
+        CHECK(replayed["k3"] == "v3");
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        REQUIRE(node.is_leader());
+        for (int i = 0; i < 5; i++) {
+            auto v = node.Read("k" + std::to_string(i));
+            REQUIRE(v.has_value());
+            CHECK(*v == "v" + std::to_string(i));
+        }
+        node.Stop();
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("raft: snapshot compacts the log and survives restart") {
+    auto dir = MakeRaftTempDir();
+    constexpr int kKeys = 50;
+
+    {
+        InMemoryTransport transport;
+        RaftConfig config;
+        config.node_id = "node1";
+        config.peers = {"node1"};
+        config.data_dir = dir;
+        config.election_timeout_min_ms = 50;
+        config.election_timeout_max_ms = 100;
+
+        RaftNode node(config, &transport, nullptr);
+        transport.RegisterNode("node1",
+            [&](const RequestVoteArgs& a) { return node.HandleRequestVote(a); },
+            [&](const AppendEntriesArgs& a) { return node.HandleAppendEntries(a); });
+        REQUIRE(node.Start().ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        REQUIRE(node.is_leader());
+
+        for (int i = 0; i < kKeys; i++) {
+            REQUIRE(node.Propose("k" + std::to_string(i), "v" + std::to_string(i)).ok());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(node.log_size() == static_cast<size_t>(kKeys));
+
+        // Take a snapshot: log should be truncated to zero (all entries applied).
+        size_t dropped = node.TakeSnapshot();
+        CHECK(dropped == static_cast<size_t>(kKeys));
+        CHECK(node.log_size() == 0);
+        CHECK(node.last_included_index() == static_cast<uint64_t>(kKeys));
+
+        // State still fully readable after compaction.
+        for (int i = 0; i < kKeys; i++) {
+            auto v = node.Read("k" + std::to_string(i));
+            REQUIRE(v.has_value());
+        }
+        node.Stop();
+    }
+
+    // Restart: recovery must rebuild state from the persisted snapshot.
+    {
+        InMemoryTransport transport;
+        RaftConfig config;
+        config.node_id = "node1";
+        config.peers = {"node1"};
+        config.data_dir = dir;
+        config.election_timeout_min_ms = 50;
+        config.election_timeout_max_ms = 100;
+
+        RaftNode node(config, &transport, nullptr);
+        transport.RegisterNode("node1",
+            [&](const RequestVoteArgs& a) { return node.HandleRequestVote(a); },
+            [&](const AppendEntriesArgs& a) { return node.HandleAppendEntries(a); });
+        REQUIRE(node.Start().ok());
+
+        CHECK(node.last_included_index() == static_cast<uint64_t>(kKeys));
+        CHECK(node.log_size() == 0);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        REQUIRE(node.is_leader());
+        for (int i = 0; i < kKeys; i++) {
+            auto v = node.Read("k" + std::to_string(i));
+            REQUIRE(v.has_value());
+            CHECK(*v == "v" + std::to_string(i));
+        }
+        node.Stop();
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("raft: follower installs a snapshot via HandleInstallSnapshot") {
+    auto dir = MakeRaftTempDir();
+    InMemoryTransport transport;
+    RaftConfig config;
+    config.node_id = "node2";
+    config.peers = {"node1", "node2", "node3"};
+    config.data_dir = dir;
+
+    RaftNode node(config, &transport, nullptr);
+    // No Start() needed: exercise the RPC handler directly.
+
+    InstallSnapshotArgs args;
+    args.term = 5;
+    args.leader_id = "node1";
+    args.last_included_index = 100;
+    args.last_included_term = 4;
+    args.data = {{"alpha", "1"}, {"beta", "2"}, {"gamma", "3"}};
+
+    auto reply = node.HandleInstallSnapshot(args);
+    CHECK(reply.success);
+    CHECK(reply.term == 5);
+
+    CHECK(node.last_included_index() == 100);
+    CHECK(node.log_size() == 0);
+    auto sm = node.state_machine_copy();
+    CHECK(sm["alpha"] == "1");
+    CHECK(sm["beta"] == "2");
+    CHECK(sm["gamma"] == "3");
+
+    // A stale snapshot (lower term) must be rejected.
+    InstallSnapshotArgs stale;
+    stale.term = 1;
+    stale.leader_id = "node1";
+    stale.last_included_index = 50;
+    auto stale_reply = node.HandleInstallSnapshot(stale);
+    CHECK(!stale_reply.success);
+    CHECK(node.last_included_index() == 100);  // unchanged
+
+    std::filesystem::remove_all(dir);
+}

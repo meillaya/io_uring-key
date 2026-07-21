@@ -2,6 +2,7 @@
 // HDR-style latency histogram for benchmark percentile tracking.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

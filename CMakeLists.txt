@@ -55,6 +55,10 @@ add_executable(kv_tests
   tests/test_backends.cpp
   tests/test_resp.cpp
   tests/test_raft.cpp
+  tests/test_server.cpp
+  tests/test_engine_features.cpp
+  tests/test_concurrency.cpp
+  tests/test_raft_tcp.cpp
 )
 target_link_libraries(kv_tests PRIVATE kv_core doctest::doctest)
 

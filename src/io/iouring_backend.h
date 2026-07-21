@@ -22,7 +22,10 @@ namespace kv {
 
 struct IOUringOptions {
     unsigned queue_depth = 256;
-    bool use_sqpoll = false;
+    // SQPOLL is attempted by default (kernel-side submission polling removes
+    // the per-op syscall); Init() falls back to a normal ring if unavailable
+    // (e.g. EPERM on kernels/configs that restrict it).
+    bool use_sqpoll = true;
     unsigned sqpoll_idle_ms = 2000;
     bool use_direct_io = false;
     bool register_buffers = true;
@@ -53,16 +56,30 @@ public:
     Status Init() {
         struct io_uring_params params;
         std::memset(&params, 0, sizeof(params));
-        if (opts_.use_sqpoll) {
+        bool want_sqpoll = opts_.use_sqpoll;
+        if (want_sqpoll) {
             params.flags |= IORING_SETUP_SQPOLL;
             params.sq_thread_idle = opts_.sqpoll_idle_ms;
         }
 
         int ret = io_uring_queue_init_params(opts_.queue_depth, &ring_, &params);
+        if (ret < 0 && want_sqpoll) {
+            // SQPOLL unavailable (commonly EPERM without CAP_SYS_NICE on some
+            // kernels): fall back to a plain submission ring so the backend
+            // still works.
+            KV_LOG_WARN("io_uring: SQPOLL init failed (%s); falling back to "
+                        "submission-ring mode", std::strerror(-ret));
+            std::memset(&params, 0, sizeof(params));
+            opts_.use_sqpoll = false;
+            ret = io_uring_queue_init_params(opts_.queue_depth, &ring_, &params);
+        }
         if (ret < 0) {
             return Status::IOError(std::string("io_uring_queue_init: ") + std::strerror(-ret));
         }
         ring_initialized_ = true;
+        if (opts_.use_sqpoll) {
+            KV_LOG_INFO("io_uring: SQPOLL enabled (kernel-side submission)");
+        }
 
         // Register buffer pool.
         if (opts_.register_buffers) {
@@ -253,6 +270,11 @@ public:
         return files_registered_;
     }
 
+    // Expose the registered buffer pool so callers can borrow aligned buffers
+    // and hit the prep_read_fixed/prep_write_fixed fast path.
+    [[nodiscard]] AlignedBufferPool* buffer_pool() { return buffer_pool_.get(); }
+    [[nodiscard]] bool sqpoll_enabled() const { return opts_.use_sqpoll; }
+
 private:
     struct FileEntry {
         int fd;
@@ -261,33 +283,51 @@ private:
         int fixed_idx;
     };
 
+    // Returns the registered-buffer index for `buf` if it is exactly the base of
+    // one of our pool buffers, else -1 (caller buffer -> normal prep_read/write).
+    int RegisteredBufferIndex(void* buf) const {
+        if (!buffers_registered_ || !buffer_pool_) return -1;
+        auto* p = static_cast<uint8_t*>(buf);
+        for (size_t i = 0; i < buffer_pool_->count(); i++) {
+            if (buffer_pool_->at(i).data() == p) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
     void PrepareSQE(struct io_uring_sqe* sqe, const IORequest& req, int tag) {
         auto it = files_.find(req.file);
         int fd = (it != files_.end()) ? it->second.fd : -1;
         int fixed_idx = (it != files_.end()) ? it->second.fixed_idx : -1;
         bool use_fixed = (fixed_idx >= 0 && files_registered_);
 
+        int use_fd = use_fixed ? fixed_idx : fd;
         switch (req.op) {
-            case IOOp::kRead:
-                if (use_fixed) {
-                    io_uring_prep_read(sqe, fixed_idx, req.buf, req.len,
-                                       static_cast<__u64>(req.offset));
-                    sqe->flags |= IOSQE_FIXED_FILE;
+            case IOOp::kRead: {
+                // Use a registered-buffer read when the caller passed one of our
+                // pool buffers (avoids the kernel re-pinning user pages per op).
+                int bidx = RegisteredBufferIndex(req.buf);
+                if (bidx >= 0) {
+                    io_uring_prep_read_fixed(sqe, use_fd, req.buf, req.len,
+                                             static_cast<__u64>(req.offset), bidx);
                 } else {
-                    io_uring_prep_read(sqe, fd, req.buf, req.len,
+                    io_uring_prep_read(sqe, use_fd, req.buf, req.len,
                                        static_cast<__u64>(req.offset));
                 }
+                if (use_fixed) sqe->flags |= IOSQE_FIXED_FILE;
                 break;
-            case IOOp::kWrite:
-                if (use_fixed) {
-                    io_uring_prep_write(sqe, fixed_idx, req.buf, req.len,
-                                        static_cast<__u64>(req.offset));
-                    sqe->flags |= IOSQE_FIXED_FILE;
+            }
+            case IOOp::kWrite: {
+                int bidx = RegisteredBufferIndex(req.buf);
+                if (bidx >= 0) {
+                    io_uring_prep_write_fixed(sqe, use_fd, req.buf, req.len,
+                                              static_cast<__u64>(req.offset), bidx);
                 } else {
-                    io_uring_prep_write(sqe, fd, req.buf, req.len,
+                    io_uring_prep_write(sqe, use_fd, req.buf, req.len,
                                         static_cast<__u64>(req.offset));
                 }
+                if (use_fixed) sqe->flags |= IOSQE_FIXED_FILE;
                 break;
+            }
             case IOOp::kFsync:
                 if (use_fixed) {
                     io_uring_prep_fsync(sqe, fixed_idx, 0);

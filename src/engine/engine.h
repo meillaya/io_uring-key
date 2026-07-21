@@ -33,7 +33,7 @@ class Engine {
 public:
     explicit Engine(std::unique_ptr<IOBackend> backend, EngineOptions opts)
         : backend_(std::move(backend)), opts_(std::move(opts)),
-          memtable_(std::make_unique<Memtable>()),
+          memtable_(std::make_shared<Memtable>()),
           wal_(backend_.get(), opts_.data_dir) {}
 
     ~Engine() {
@@ -50,12 +50,13 @@ public:
         if (!s.ok()) return s;
 
         // Replay WAL into memtable.
+        auto mt = memtable_.load(std::memory_order_relaxed);
         size_t replayed = 0;
         s = wal_.Replay([&](const WALRecord& rec) -> bool {
             if (rec.type == WALRecordType::kPut) {
-                memtable_->Put(rec.key, rec.value);
+                mt->Put(rec.key, rec.value);
             } else if (rec.type == WALRecordType::kDelete) {
-                memtable_->Delete(rec.key);
+                mt->Delete(rec.key);
             }
             return true;
         }, &replayed);
@@ -85,10 +86,11 @@ public:
         }
 
         // Write to memtable.
-        memtable_->Put(key, value);
+        auto mt = memtable_.load(std::memory_order_acquire);
+        mt->Put(key, value);
 
         // Check if memtable needs flushing.
-        if (memtable_->ShouldFlush(opts_.memtable_flush_threshold)) {
+        if (mt->ShouldFlush(opts_.memtable_flush_threshold)) {
             s = FlushMemtable();
             if (!s.ok()) return s;
         }
@@ -107,9 +109,10 @@ public:
             if (!s.ok()) return s;
         }
 
-        memtable_->Delete(key);
+        auto mt = memtable_.load(std::memory_order_acquire);
+        mt->Delete(key);
 
-        if (memtable_->ShouldFlush(opts_.memtable_flush_threshold)) {
+        if (mt->ShouldFlush(opts_.memtable_flush_threshold)) {
             s = FlushMemtable();
             if (!s.ok()) return s;
         }
@@ -117,30 +120,116 @@ public:
         return Status::OK();
     }
 
-    // Get a value. Returns nullopt if not found.
-    std::optional<std::string> Get(std::string_view key) {
-        // Check memtable first (most recent data).
-        auto mem_result = memtable_->Get(key);
+    // Authoritative read path (G008): distinguishes "not found" from
+    // "corruption". Returns Status::OK() with *out set on a clean lookup
+    // (nullopt *out == not found / tombstoned); returns Status::Corruption or
+    // Status::IOError if an underlying SSTable read fails a CRC/IO check.
+    Status Get(std::string_view key, std::optional<std::string>* out) {
+        if (out) out->reset();
+
+        // Check memtable first (most recent data). Load a stable snapshot of the
+        // memtable pointer so a concurrent flush swap cannot race with us.
+        auto mt = memtable_.load(std::memory_order_acquire);
+        auto mem_result = mt->Get(key);
         if (mem_result.has_value()) {
-            if (mem_result->second) return std::nullopt;  // Tombstone.
-            return mem_result->first;
+            if (mem_result->second) return Status::OK();  // Tombstone -> not found.
+            if (out) *out = mem_result->first;
+            return Status::OK();
         }
 
         // Check SSTables from newest to oldest.
         std::lock_guard lock(sst_mu_);
         for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
             bool is_tombstone = false;
-            auto val = it->reader->Get(key, &is_tombstone);
-            if (val.has_value()) return val;
-            if (is_tombstone) return std::nullopt;  // Deleted in this SSTable.
+            std::optional<std::string> val;
+            auto s = it->reader->Get(key, &val, &is_tombstone);
+            if (!s.ok()) return s;          // Surface corruption / IO error.
+            if (val.has_value()) {
+                if (out) *out = std::move(val);
+                return Status::OK();
+            }
+            if (is_tombstone) return Status::OK();  // Deleted in this SSTable.
         }
 
-        return std::nullopt;
+        return Status::OK();  // Not found anywhere.
+    }
+
+    // Convenience overload: returns nullopt for both "not found" and any error.
+    // Callers that must distinguish corruption (e.g. the RESP server) should use
+    // the Status-returning Get(key, out*) above.
+    std::optional<std::string> Get(std::string_view key) {
+        std::optional<std::string> out;
+        auto s = Get(key, &out);
+        if (!s.ok()) return std::nullopt;
+        return out;
+    }
+
+    // Count of live (non-tombstoned) keys across memtable + SSTables.
+    // Newest version wins; used by DBSIZE.
+    [[nodiscard]] size_t DbSize() {
+        std::map<std::string, bool> live;  // key -> is_live (first/newest wins)
+        auto mt = memtable_.load(std::memory_order_acquire);
+        mt->ForEach([&](const MemtableEntry& e) {
+            live.emplace(e.key, !e.is_tombstone);
+        });
+        std::lock_guard lock(sst_mu_);
+        for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
+            auto* reader = it->reader.get();
+            (void)reader->ForEach([&](const SSTableEntry& e) -> bool {
+                live.emplace(e.key, !e.is_tombstone);
+                return true;
+            });
+        }
+        size_t count = 0;
+        for (auto& [k, is_live] : live) {
+            if (is_live) count++;
+        }
+        return count;
+    }
+
+    // FLUSHDB (G008): delete ALL data — clear the active memtable, remove every
+    // SSTable file, and truncate the WAL. Scoped to this engine's data dir only.
+    // After this, DbSize() == 0 and previously written keys are gone.
+    Status Clear() {
+        std::lock_guard wlock(write_mu_);
+
+        // 1. Reset the memtable (swap in a fresh empty one; in-flight readers
+        //    keep their shared_ptr to the old table until they finish).
+        memtable_.store(std::make_shared<Memtable>(), std::memory_order_release);
+
+        // 2. Remove all SSTable files + drop the readers.
+        std::vector<std::string> paths;
+        {
+            std::lock_guard lock(sst_mu_);
+            for (auto& sst : sstables_) paths.push_back(sst.path);
+            sstables_.clear();
+        }
+        for (auto& path : paths) {
+            auto s = backend_->Delete(path);
+            if (!s.ok()) {
+                KV_LOG_WARN("Clear: failed to delete %s: %s",
+                            path.c_str(), s.ToString().c_str());
+            }
+        }
+
+        // 3. Truncate the WAL so recovery does not resurrect the cleared keys.
+        auto s = wal_.Truncate();
+        if (!s.ok()) return s;
+
+        KV_LOG_WARN("Clear: flushed all engine data (%zu SSTables removed)", paths.size());
+        return Status::OK();
+    }
+
+    // Test/observability accessor: number of SSTables currently loaded.
+    [[nodiscard]] size_t sstable_count() {
+        std::lock_guard lock(sst_mu_);
+        return sstables_.size();
     }
 
     // Flush memtable to a new SSTable.
     Status FlushMemtable() {
-        auto entries_vec = memtable_->Entries();
+        auto mt = memtable_.load(std::memory_order_acquire);
+        auto entries_vec = mt->Entries();
         if (entries_vec.empty()) return Status::OK();
 
         // Convert to SSTable entries.
@@ -164,10 +253,15 @@ public:
         s = reader->Open();
         if (!s.ok()) return s;
 
+        // Real on-disk size (needed for size-tiered compaction grouping).
+        uint64_t file_size = 0;
+        std::error_code ec;
+        auto fsz = std::filesystem::file_size(sst_path, ec);
+        if (!ec) file_size = static_cast<uint64_t>(fsz);
+
+        size_t l0_count = 0;
         {
             std::lock_guard lock(sst_mu_);
-            uint64_t file_size = 0;
-            backend_->FileSize(0, &file_size);  // Approximate.
             sstables_.push_back({
                 .path = sst_path,
                 .file_size = file_size,
@@ -175,15 +269,27 @@ public:
                 .sequence = seq,
                 .reader = std::move(reader),
             });
+            for (auto& t : sstables_) {
+                if (t.level == 0) l0_count++;
+            }
         }
 
-        // Truncate WAL and reset memtable.
+        // Truncate WAL and reset memtable (swap in a fresh empty memtable; the
+        // atomic store lets concurrent Get() readers finish on the old table).
         s = wal_.Truncate();
         if (!s.ok()) return s;
 
-        memtable_ = std::make_unique<Memtable>();
+        memtable_.store(std::make_shared<Memtable>(), std::memory_order_release);
 
         KV_LOG_INFO("Flushed memtable to %s (%zu entries)", sst_path.c_str(), sst_entries.size());
+
+        // G008: wire compaction into the flush path. Trigger when the level-0
+        // SSTable count exceeds the size-tiered threshold.
+        if (l0_count >= SizeTieredCompaction::kMinTablesForCompaction) {
+            auto cs = MaybeCompact();
+            if (!cs.ok()) return cs;
+        }
+
         return Status::OK();
     }
 
@@ -229,9 +335,14 @@ public:
             return std::find(old_paths.begin(), old_paths.end(), sst.path) != old_paths.end();
         });
 
+        uint64_t out_size = 0;
+        std::error_code ec;
+        auto fsz = std::filesystem::file_size(output_path, ec);
+        if (!ec) out_size = static_cast<uint64_t>(fsz);
+
         sstables_.push_back({
             .path = output_path,
-            .file_size = 0,
+            .file_size = out_size,
             .level = 0,
             .sequence = seq,
             .reader = std::move(reader),
@@ -311,7 +422,7 @@ private:
 
     std::unique_ptr<IOBackend> backend_;
     EngineOptions opts_;
-    std::unique_ptr<Memtable> memtable_;
+    std::atomic<std::shared_ptr<Memtable>> memtable_;
     WAL wal_;
     std::vector<SSTableHandle> sstables_;
     std::mutex write_mu_;

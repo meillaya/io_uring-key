@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -79,7 +80,9 @@ private:
 
     RespValue CmdGet(const std::vector<std::string>& args) {
         if (args.size() < 2) return RespValue::Error("ERR wrong number of arguments for 'get'");
-        auto val = engine_.Get(args[1]);
+        std::optional<std::string> val;
+        auto st = engine_.Get(args[1], &val);
+        if (!st.ok()) return RespValue::Error("ERR " + st.ToString());  // e.g. Corruption
         if (!val.has_value()) return RespValue::NullBulkString();
         return RespValue::BulkString(*val);
     }
@@ -131,16 +134,17 @@ private:
     }
 
     RespValue CmdDbsize(const std::vector<std::string>&) {
-        // Approximate: count keys in memtable + SSTables.
-        // For now, return 0 as a placeholder.
-        return RespValue::Integer(0);
+        // Count live keys across memtable + SSTables (newest version wins).
+        return RespValue::Integer(static_cast<int64_t>(engine_.DbSize()));
     }
 
     RespValue CmdFlushdb(const std::vector<std::string>&) {
-        // FLUSHDB: delete all keys in the engine's configured data dir.
-        // This is scoped to the engine's own data dir only.
+        // FLUSHDB (G008): delete ALL keys — clear the active memtable, remove
+        // every SSTable file, and truncate the WAL. Scoped to the engine's own
+        // data dir only. After this DBSIZE returns 0 and prior keys are gone.
         KV_LOG_WARN("FLUSHDB: clearing engine data");
-        // TODO: implement full flush (iterate all keys and delete).
+        auto st = engine_.Clear();
+        if (!st.ok()) return RespValue::Error("ERR " + st.ToString());
         return RespValue::SimpleString("OK");
     }
 
@@ -149,7 +153,7 @@ private:
                           "kv_engine:kernel-v2\r\n"
                           "io_backend:" + std::string(engine_.backend()->Name()) + "\r\n"
                           "# Keyspace\r\n"
-                          "db0:keys=0,expires=0\r\n";
+                          "db0:keys=" + std::to_string(engine_.DbSize()) + ",expires=0\r\n";
         return RespValue::BulkString(info);
     }
 
