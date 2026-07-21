@@ -16,8 +16,6 @@
 
 namespace kv {
 
-// Tombstone marker for deletions.
-inline constexpr const char* kTombstone = "\x00__TOMBSTONE__\x00";
 
 struct MemtableEntry {
     std::string key;
@@ -142,12 +140,7 @@ private:
 
         // Insert new node.
         int new_level = RandomLevel();
-        if (new_level > level_) {
-            for (int i = level_; i < new_level; i++) {
-                // head_ already has kMaxLevel slots
-            }
-            level_ = new_level;
-        }
+        if (new_level > level_) level_ = new_level;
 
         MemtableEntry entry{std::move(key), std::move(value), tombstone};
         auto* node = new Node(std::move(entry), new_level);

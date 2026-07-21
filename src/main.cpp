@@ -38,7 +38,6 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, SignalHandler);
     std::signal(SIGTERM, SignalHandler);
 
-    // Create backend.
     std::unique_ptr<IOBackend> backend;
     if (backend_name == "sync") {
         backend = std::make_unique<SyncBackend>();
