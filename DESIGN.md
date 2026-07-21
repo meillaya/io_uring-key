@@ -89,3 +89,23 @@ Held constant:
 - [ ] G4: Redis RESP2 API + shared net reactor
 - [ ] G5: Raft-lite near-full over TCP
 - [ ] G6: Hardening, docs, final benchmark report
+
+## Raft-lite Read Consistency (v1)
+
+**v1 reads are leader-only.** All client reads are served by the Raft leader
+using either ReadIndex or a leader lease mechanism. This guarantees linearizable
+reads without the complexity of follower reads.
+
+- **ReadIndex:** The leader confirms it is still the leader by exchanging
+  heartbeats with a majority of followers before serving a read. The read is
+  served at the current commit index.
+- **Leader lease:** The leader assumes it remains the leader for a bounded
+  time after receiving a majority heartbeat response. Reads within the lease
+  period are served without additional round trips.
+
+Follower reads (leasing to followers, or ReadIndex forwarding) are explicitly
+**OUT of scope** for v1. This prevents stale-read claims and simplifies the
+consistency model.
+
+**Dynamic joint-consensus membership changes are STRETCH only** — skipped
+unless time remains. The v1 cluster has a fixed membership configured at startup.
