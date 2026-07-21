@@ -48,6 +48,10 @@ enable_testing()
 add_executable(kv_tests
   tests/test_main.cpp
   tests/test_hello.cpp
+  tests/test_util.cpp
+  tests/test_differential.cpp
+  tests/test_wal_recovery.cpp
+  tests/test_crash_recovery.cpp
 )
 target_link_libraries(kv_tests PRIVATE kv_core doctest::doctest)
 
