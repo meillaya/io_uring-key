@@ -53,6 +53,7 @@ add_executable(kv_tests
   tests/test_crash_recovery.cpp
   tests/test_iouring.cpp
   tests/test_backends.cpp
+  tests/test_resp.cpp
 )
 target_link_libraries(kv_tests PRIVATE kv_core doctest::doctest)
 
