@@ -5,14 +5,20 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -27,6 +33,9 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 6379;
     int backlog = 128;
+    size_t max_connections = 1024;
+    int idle_timeout_ms = 300000;  // 5 minutes; 0 disables the timeout.
+    std::string requirepass;       // Empty means auth is disabled.
 };
 
 class Server {
@@ -49,7 +58,11 @@ public:
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(opts_.port);
-        ::inet_pton(AF_INET, opts_.host.c_str(), &addr.sin_addr);
+        if (::inet_pton(AF_INET, opts_.host.c_str(), &addr.sin_addr) != 1) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return Status::InvalidArgument("invalid IPv4 host: " + opts_.host);
+        }
 
         if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
             ::close(listen_fd_);
@@ -90,6 +103,16 @@ public:
             ::close(fd);
         }
         if (accept_thread_.joinable()) accept_thread_.join();
+
+        // Unblock handlers that are parked in recv. The accept loop is gone, so
+        // no new descriptors can enter the set.
+        {
+            std::lock_guard lock(clients_mu_);
+            for (int client_fd : client_fds_) {
+                ::shutdown(client_fd, SHUT_RDWR);
+            }
+        }
+
         // The accept loop owns client_threads_ while running; now that it is
         // joined, join any handlers still live (finished ones were already reaped).
         for (auto& c : client_threads_) {
@@ -113,6 +136,13 @@ private:
                 if (errno == EINTR) continue;
                 if (!running_) break;
                 KV_LOG_ERROR("accept: %s", std::strerror(errno));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            if (live_connections_.load() >= opts_.max_connections) {
+                SendValue(client_fd, RespValue::Error("ERR max clients reached"));
+                ::close(client_fd);
                 continue;
             }
 
@@ -120,16 +150,35 @@ private:
             int opt = 1;
             ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+            if (opts_.idle_timeout_ms > 0) {
+                struct timeval tv{};
+                tv.tv_sec = opts_.idle_timeout_ms / 1000;
+                tv.tv_usec = (opts_.idle_timeout_ms % 1000) * 1000;
+                ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            }
+
             // Reap finished connection handlers so the thread list stays bounded
             // by LIVE connections rather than every connection ever accepted.
             ReapClients();
+            {
+                std::lock_guard lock(clients_mu_);
+                client_fds_.insert(client_fd);
+                live_connections_.fetch_add(1);
+            }
+
             auto done = std::make_shared<std::atomic<bool>>(false);
-            client_threads_.push_back(ClientConn{
-                std::thread([this, client_fd, done] {
-                    HandleClient(client_fd);
-                    done->store(true, std::memory_order_release);
-                }),
-                done});
+            try {
+                client_threads_.push_back(ClientConn{
+                    std::thread([this, client_fd, done] {
+                        HandleClient(client_fd);
+                        done->store(true, std::memory_order_release);
+                    }),
+                    done});
+            } catch (const std::exception& e) {
+                KV_LOG_ERROR("client thread start failed: %s", e.what());
+                RemoveClient(client_fd);
+            }
         }
     }
 
@@ -143,9 +192,42 @@ private:
         std::erase_if(client_threads_, [](const ClientConn& c) { return !c.th.joinable(); });
     }
 
+    static bool ConstantTimeEquals(std::string_view a, std::string_view b) {
+        if (a.size() != b.size()) return false;
+        unsigned char diff = 0;
+        for (size_t i = 0; i < a.size(); i++) {
+            diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+        }
+        return diff == 0;
+    }
+
+    RespValue HandleAuth(const std::vector<std::string>& args, bool* authenticated) {
+        std::string cmd = args[0];
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::toupper);
+        if (cmd != "AUTH" || args.size() != 2) {
+            return RespValue::Error("NOAUTH Authentication required.");
+        }
+        if (!ConstantTimeEquals(args[1], opts_.requirepass)) {
+            return RespValue::Error("ERR invalid password");
+        }
+        *authenticated = true;
+        return RespValue::SimpleString("OK");
+    }
+
+    void RemoveClient(int fd) {
+        std::lock_guard lock(clients_mu_);
+        if (client_fds_.erase(fd) > 0) {
+            live_connections_.fetch_sub(1);
+        }
+        ::close(fd);
+    }
+
+    void CloseClient(int fd) { RemoveClient(fd); }
+
     void HandleClient(int fd) {
         std::string buffer;
         char recv_buf[65536];
+        bool authenticated = opts_.requirepass.empty();
 
         // Defense in depth (G008): no exception may escape the connection loop.
         // Any throw (parse, alloc, dispatch) is converted into a RESP -ERR reply
@@ -156,6 +238,11 @@ private:
                 if (n <= 0) break;
 
                 buffer.append(recv_buf, static_cast<size_t>(n));
+                if (buffer.size() > kMaxConnectionBuffer) {
+                    SendError(fd, "ERR request too large");
+                    CloseClient(fd);
+                    return;
+                }
 
                 // Process all complete commands in the buffer.
                 while (true) {
@@ -164,7 +251,7 @@ private:
                         parsed = RespParser::ParseCommandSafe(buffer);
                     } catch (const std::exception& e) {
                         SendError(fd, std::string("ERR internal error: ") + e.what());
-                        ::close(fd);
+                        CloseClient(fd);
                         return;
                     }
 
@@ -175,7 +262,7 @@ private:
                         // the connection (matches Redis behavior). The server
                         // itself keeps running.
                         SendError(fd, "ERR protocol error: " + parsed.error);
-                        ::close(fd);
+                        CloseClient(fd);
                         return;
                     }
 
@@ -185,6 +272,8 @@ private:
                     try {
                         if (parsed.args.empty()) {
                             response = RespValue::Error("ERR empty command");
+                        } else if (!authenticated) {
+                            response = HandleAuth(parsed.args, &authenticated);
                         } else {
                             response = handler_.Execute(parsed.args);
                         }
@@ -203,7 +292,7 @@ private:
             KV_LOG_ERROR("connection error: unknown");
         }
 
-        ::close(fd);
+        CloseClient(fd);
     }
 
     // Serialize and fully send a RESP value. Returns false on socket failure.
@@ -213,6 +302,7 @@ private:
         while (sent < serialized.size()) {
             ssize_t w = ::send(fd, serialized.data() + sent,
                                serialized.size() - sent, MSG_NOSIGNAL);
+            if (w < 0 && errno == EINTR) continue;
             if (w <= 0) return false;
             sent += static_cast<size_t>(w);
         }
@@ -223,12 +313,17 @@ private:
         SendValue(fd, RespValue::Error(msg));
     }
 
+    static constexpr size_t kMaxConnectionBuffer = 64 * 1024 * 1024;
+
     Engine& engine_;
     CommandHandler handler_;
     ServerOptions opts_;
     std::atomic<int> listen_fd_;
     std::atomic<bool> running_;
     std::thread accept_thread_;
+    std::mutex clients_mu_;
+    std::set<int> client_fds_;
+    std::atomic<size_t> live_connections_{0};
     // A tracked client handler plus a flag it sets on completion so the accept
     // loop can reap finished threads (list bounded by live connections).
     struct ClientConn {

@@ -147,6 +147,7 @@ public:
 
         size_t pos = 0;
         size_t count = 0;
+        size_t valid_end = 0;
 
         while (pos + 4 <= file_size) {
             // Read record_len.
@@ -205,9 +206,34 @@ public:
             if (!cb(rec)) break;
             count++;
             pos += total_record_size;
+            valid_end = pos;
+        }
+
+        // A torn or corrupt tail stays in the file. Cut it before the engine
+        // accepts new writes, otherwise the next replay stops at the old tail
+        // and loses every record appended after it.
+        if (valid_end < file_size) {
+            KV_LOG_WARN("WAL replay: truncating %zu trailing bytes at offset %zu",
+                        static_cast<size_t>(file_size - valid_end), valid_end);
+            auto truncate_status = TruncateTo(valid_end);
+            if (!truncate_status.ok()) return truncate_status;
         }
 
         if (records_replayed) *records_replayed = count;
+        return Status::OK();
+    }
+
+    // Truncate the WAL to the last valid record after replay.
+    Status TruncateTo(uint64_t size) {
+        if (fh_ == kInvalidFile) {
+            return Status::InvalidArgument("WAL is not open");
+        }
+        auto s = backend_->Truncate(fh_, size);
+        if (!s.ok()) return s;
+        s = backend_->Sync(fh_, false);
+        if (!s.ok()) return s;
+        write_offset_ = size;
+        pending_sync_ = false;
         return Status::OK();
     }
 
@@ -219,12 +245,13 @@ public:
             fh_ = kInvalidFile;
         }
         std::string path = dir_ + "/wal.log";
-        backend_->Delete(path);
-        auto s = backend_->Open(path, true, false, &fh_);
+        auto s = backend_->Delete(path);
+        if (!s.ok()) return s;
+        s = backend_->Open(path, true, false, &fh_);
         if (!s.ok()) return s;
         write_offset_ = 0;
         pending_sync_ = false;
-        return Status::OK();
+        return backend_->SyncDirectory(dir_);
     }
 
     [[nodiscard]] uint64_t write_offset() const { return write_offset_; }

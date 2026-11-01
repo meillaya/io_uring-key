@@ -1,7 +1,8 @@
 # Audit of io_uring-key
 
 Date: 2026-10-31
-Commit: 30c7365
+Base commit: 30c7365
+Status: remediated
 Scope: source, build config, tests, and docs.
 
 ## Method
@@ -12,10 +13,10 @@ container's seccomp policy blocked io_uring, so the backend tests were not run
 here. I also wrote small programs against the headers to confirm the storage,
 server, and Raft findings below.
 
-The build reports 57 of 58 tests passing. The failure is the C++23 version
-check, which expects `__cplusplus >= 202302L`; GCC 13 reports `202100L`. The
-project asks for GCC 16, so this is a local toolchain mismatch, not a code
-finding.
+At the base commit the build reported 57 of 58 tests passing. The failure was
+the C++23 version check, which expected `__cplusplus >= 202302L`; GCC 13 reports
+`202100L`. After remediation the scaffold test is gone, and the suite passes
+74/74 without io_uring and 82/82 with it.
 
 ## Summary
 
@@ -33,7 +34,41 @@ correctness or liveness:
    transport serializes uninitialized replies for malformed frames.
 6. `Server::Stop()` hangs when a client is connected and idle.
 
+## Remediation
+
+This audit was remediated after the base commit. The findings below are kept as
+the original record, including the repros. The table maps them to the current
+fix and regression test.
+
+| Finding | Status | Fix and test |
+| --- | --- | --- |
+| 1. WAL torn tail | fixed | `WAL::Replay` truncates to the last valid record and fsyncs it. `tests/test_remediation.cpp`, WAL tail test. |
+| 2. Mixed-size compaction | fixed | Level-0 compaction now merges every table. Mixed-size compaction test. |
+| 3. Corrupt bloom filter | fixed | CRC, size, and zero-bit checks in `BloomFilter::Deserialize`. Corrupt bloom and index tests. |
+| 4. Corrupt Raft state | fixed | `LoadState` fails closed and checks bounds. Persistence failures reject votes, proposals, and commits. Corrupt-state test. |
+| 5. Uninitialized Raft replies | fixed | Reply structs are value-initialized and transport status is checked. Failed-transport term test. |
+| 6. Stop hangs on idle client | fixed | Accepted sockets are tracked and shut down in `Stop`. Idle-client test. |
+| 7. Raft not in server | documented | The README and `DESIGN.md` now state that `kv_server` is single-node and Raft is a separate library. |
+| 8. Dev shell build mismatch | fixed | liburing requirement is 2.14, matching the pinned nixpkgs. Configured with a 2.14 version shim. |
+| 9. Benchmark is not YCSB | fixed | D reads the latest key, E scans 10 keys, F does read-modify-write, and the CSV records `sync_wal`. CSV regenerated. |
+| 10. Redis semantics | fixed | SET options are validated, EX is rejected, NX/XX use one engine lock, MSET uses a batch, DEL and MGET propagate errors, SELECT parses its index, SCAN is implemented. Command test. |
+| 11. Raft match index | fixed | Follower replies report the last covered index, not its tail. Match-index test. |
+| 12. Snapshot retry loop | fixed | An equal snapshot base returns success. Equal-base test. |
+| 13. RESP line growth | fixed | The parser rejects an unterminated line past 64 KiB and the server caps the connection buffer at 64 MiB. Long-line test. |
+| 14. SSTable offset validation | fixed | Footer offsets, index CRC, index bounds, bloom CRC, and block bounds are checked. Corruption tests. |
+| 15. Stray SSTable name | fixed | Sequence parsing uses `std::from_chars`; invalid names and `.tmp` files are ignored or removed. Startup test. |
+| 16. Invalid host binds all | fixed | `Server` and `TcpRaftTransport` check `inet_pton`. Invalid-host test. |
+| 17. No power-loss test | improved | SSTables are written as `.tmp`, renamed, and directory-synced; flush, compaction, and WAL truncation sync the directory. A fault-injection test covers the failure path. A real power-cut test is still absent. |
+
+The medium findings are also addressed: CI runs build, ASan/UBSan, and TSan; the
+scaffold tests are gone; compaction releases the SSTable lock during the merge;
+`DBSIZE` caches its count; connections have a limit, idle timeout, and optional
+password auth; `DbSize` serializes with writes; the log level is atomic; and
+the dead `src/net` placeholder is removed. TLS is still absent and is stated as
+a limit in the README.
+
 ## Critical findings
+
 
 ### 1. A torn WAL tail is not truncated
 
@@ -301,13 +336,23 @@ truncating the WAL. Add a test that injects a crash between those steps.
 6. Track client sockets and shut them down in `Server::Stop`.
 7. Wire Raft into the server or remove it from the server architecture.
 
-## What this pass changed
+## What the remediation changed
 
-- `CMakeLists.txt`: liburing requirement lowered to 2.14.
-- `.gitignore`: the architecture PNG under `docs/figures` is tracked.
-- `README.md`: rewritten to match the code.
-- `docs/AUDIT.md`: this audit.
-- `docs/figures/`: architecture scene, generator, render, and notes.
-- `DESIGN.md`: a status note and the two false claims corrected.
-
-No storage, server, or Raft code was changed in this pass.
+- `WAL`: truncates torn tails, fsyncs the cut, and syncs the WAL directory.
+- `IOBackend`: added `Truncate` and `SyncDirectory` to all four backends.
+- `Engine`: temp files with atomic rename, directory sync before WAL truncation,
+  full level-0 merge, lock release during merge, conditional writes, batches,
+  `Keys`, `Scan`, and a cached `DbSize`.
+- `SSTable`: bloom CRC and size checks, index CRC, footer range checks, bounded
+  block parsing.
+- `Server`: socket tracking for shutdown, buffer cap, connection limit, idle
+  timeout, optional password auth, host validation.
+- `RESP`: unterminated line cap.
+- `Raft`: fail-closed state load, persistence checks, non-blocking RPC locks to
+  avoid inline-transport ABBA, reply initialization, covered match index,
+  idempotent snapshot install.
+- `Bench`: read-latest, scan, read-modify-write, sync policy flag, CSV column.
+- Build: liburing 2.14, sanitizer targets, pinned doctest, GitHub Actions CI.
+- Tests: `tests/test_remediation.cpp`, scaffold test removed, 82 cases with
+  io_uring and 74 without.
+- Docs: README, `DESIGN.md`, and the figure source label updated.

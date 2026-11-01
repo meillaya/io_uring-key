@@ -206,7 +206,10 @@ public:
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port_);
-        ::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr);
+        if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+            ::close(listen_fd_); listen_fd_ = -1;
+            return Status::InvalidArgument("invalid IPv4 host: " + host_);
+        }
         if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
             ::close(listen_fd_); listen_fd_ = -1;
             return Status::IOError(std::string("bind: ") + std::strerror(errno));
@@ -331,25 +334,35 @@ private:
         std::string reply_payload;
         switch (type) {
             case 1: {
-                RequestVoteArgs a; RequestVoteReply r;
-                if (rpc_detail::DeVoteArgs(payload, &a) && vote_handler_) r = vote_handler_(a);
-                reply_payload = rpc_detail::SerVoteReply(r);
+                RequestVoteArgs a{};
+                if (!rpc_detail::DeVoteArgs(payload, &a) || !vote_handler_) {
+                    ::close(fd);
+                    return;
+                }
+                reply_payload = rpc_detail::SerVoteReply(vote_handler_(a));
                 break;
             }
             case 2: {
-                AppendEntriesArgs a; AppendEntriesReply r;
-                if (rpc_detail::DeAppendArgs(payload, &a) && append_handler_) r = append_handler_(a);
-                reply_payload = rpc_detail::SerAppendReply(r);
+                AppendEntriesArgs a{};
+                if (!rpc_detail::DeAppendArgs(payload, &a) || !append_handler_) {
+                    ::close(fd);
+                    return;
+                }
+                reply_payload = rpc_detail::SerAppendReply(append_handler_(a));
                 break;
             }
             case 3: {
-                InstallSnapshotArgs a; InstallSnapshotReply r;
-                if (rpc_detail::DeSnapArgs(payload, &a) && snapshot_handler_) r = snapshot_handler_(a);
-                reply_payload = rpc_detail::SerSnapReply(r);
+                InstallSnapshotArgs a{};
+                if (!rpc_detail::DeSnapArgs(payload, &a) || !snapshot_handler_) {
+                    ::close(fd);
+                    return;
+                }
+                reply_payload = rpc_detail::SerSnapReply(snapshot_handler_(a));
                 break;
             }
             default:
-                break;
+                ::close(fd);
+                return;
         }
         WriteReply(fd, reply_payload);
         ::close(fd);

@@ -8,21 +8,21 @@
 
 `kv_server` is a single-process key-value server. It speaks RESP2 over TCP and
 stores data in an LSM tree: a write-ahead log, a skip-list memtable, block-based
-SSTables, and size-tiered compaction. Four backends implement one I/O interface:
-`sync`, `threadpool`, `mmap`, and `io_uring`.
+SSTables, and level-0 full compaction. Four backends implement one I/O
+interface: `sync`, `threadpool`, `mmap`, and `io_uring`.
 
-The repository also contains a Raft consensus library, a YCSB-style benchmark
+The repository also contains a Raft consensus library, a YCSB-inspired benchmark
 harness, and a chart script. The server does not start the Raft library. The
 source and runtime messages use the internal name `kernel-v2`.
 
-This is a research prototype for systems programmers. It has known
-correctness gaps. Read [Limits](#limits) before you trust it with data.
+This is a research prototype for systems programmers. It has known gaps. Read
+[Limits](#limits) before you trust it with data.
 
 ## Requirements
 
 The dev shell supplies liburing 2.14, GCC 16, Clang 22, CMake 4.1, Python 3, and
 matplotlib. Without Nix you need Linux with io_uring, liburing 2.14 or newer,
-CMake 3.28 or newer, and GCC 16 or Clang 22.
+CMake 3.28 or newer, and a C++23 compiler. The CI build uses GCC 13.
 
 ## Quick start
 
@@ -56,6 +56,9 @@ Run the benchmark and render its charts:
 python3 tools/charts.py --input benchmark_results.csv --output charts/
 ```
 
+Pass `--sync-wal` to `kv_bench` when you want each write fsynced. The default
+skips the WAL fsync and records that policy in the CSV.
+
 ## Architecture
 
 ![Architecture](docs/figures/architecture.png)
@@ -67,51 +70,55 @@ figure source and render command are in
 
 ## What works
 
-- LSM engine: CRC-checked WAL, skip-list memtable, block SSTables with sparse
-  indexes and bloom filters, and size-tiered compaction.
+- LSM engine: CRC-checked WAL with torn-tail repair, skip-list memtable,
+  block SSTables with sparse indexes and bloom filters, level-0 full
+  compaction, and temp-file renames with directory sync.
 - I/O backends: `sync`, `threadpool`, `mmap`, and `io_uring`. The io_uring
   backend supports batched submission, registered buffers and files, and
   optional SQPOLL with a fallback. The engine still submits one operation at a
   time on its hot path.
 - RESP2 server: `PING`, `ECHO`, `GET`, `SET`, `DEL`, `EXISTS`, `MGET`, `MSET`,
-  `DBSIZE`, `FLUSHDB`, `INFO`, `SELECT`, `COMMAND`, and a stub `SCAN`.
+  `DBSIZE`, `FLUSHDB`, `INFO`, `SELECT`, `COMMAND`, `SCAN`, and `AUTH`.
+- Server controls: optional shared-password auth, a connection limit, and an
+  idle timeout. Set `--requirepass secret` or `KV_REQUIREPASS` to enable auth.
 - Raft library: elections, log replication, a persistent log, snapshots, and a
   TCP transport. Unit and in-process cluster tests cover it.
-- Benchmarks: a YCSB-style A to F generator, p50/p95/p99 capture, CSV export,
-  and matplotlib charts.
+- Benchmarks: YCSB-inspired A to F, including read-latest (D), 10-key scans
+  (E), and read-modify-write (F). CSV export and matplotlib charts.
 
 ## Limits
 
-- A torn WAL tail is never truncated. Writes accepted after recovery can be
-  lost on the next restart. Mixed-size compaction can return stale values, and
-  a corrupt bloom filter can crash reads. [docs/AUDIT.md](docs/AUDIT.md) gives
-  each one a repro.
-- `SET ... EX` parses a TTL and does not enforce it. `SCAN` returns an empty
-  list. `SELECT` ignores its argument.
-- `SET NX/XX`, `MSET`, and `DEL` are not atomic. `MSET` ignores write failures.
+- `SET ... EX` is rejected with an error. TTL is not implemented.
+- `MSET` is serialized under one write lock, but a crash can leave a prefix of
+  the batch. It is not crash-atomic.
 - The Raft library is not part of the server. The leader serves reads without a
   ReadIndex confirmation.
-- `Server::Stop()` can block on an idle client. There is no TLS, auth, or
-  connection limit.
-- Networking uses POSIX sockets. There is no io_uring network reactor.
+- TLS is not implemented. `AUTH` is a shared password over plain TCP, so do not
+  expose the server to an untrusted network.
+- `SCAN` and benchmark workload E collect every live key for each call. They are
+  correct at small scale and do not scale with the dataset.
+- The benchmark uses uniform keys, not the Zipfian distribution of the default
+  YCSB driver.
+- Crash tests use SIGKILL. Directory fsync is covered by a fault-injection test,
+  not by a real power cut.
+- Compaction is a full level-0 merge. There is no leveled compaction.
 
 ## Benchmarks
 
-`./build/kv_bench --keys 1000 --ops 5000` on the development host. The table is
-the unweighted mean of the six per-workload throughputs in
-`benchmark_results.csv`.
+`./build/kv_bench --keys 1000 --ops 5000` on a Linux 7.2 aarch64 VM with four
+vCPUs. All rows use `sync_wal=false`.
 
-| Backend | Mean ops/s | vs sync |
-| --- | ---: | ---: |
-| `sync` | 286k | 1.00x |
-| `mmap` | 262k | 0.91x |
-| `io_uring` | 217k | 0.76x |
-| `threadpool` | 197k | 0.69x |
+| Backend | A | B | C | D | E | F |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sync` | 1.00M | 3.13M | 5.65M | 3.84M | 14.3k | 911.5k |
+| `threadpool` | 63.8k | 530.7k | 5.41M | 600.9k | 13.6k | 68.4k |
+| `mmap` | 45.7k | 395.1k | 5.49M | 428.5k | 13.5k | 44.6k |
+| `io_uring` | 90.8k | 732.2k | 5.47M | 693.3k | 13.5k | 81.7k |
 
-The harness sets `sync_wal = false`, so writes do not fsync the WAL. Workloads
-B, D, and E use the same 95/5 uniform point-read mix; E does not scan. Treat the
-table as a smoke benchmark, not a YCSB result. io_uring is fastest on read-only
-workload C, at 506k against 390k for sync.
+A is 50/50 read/write, B is 95/5, C is read-only, D reads the latest key, E
+spends 95% of operations on 10-key scans, and F spends 50% on read-modify-write.
+The scan numbers are low because each scan rebuilds the live-key set. Treat the
+table as a smoke benchmark, not a production comparison.
 
 ## Layout
 
@@ -128,11 +135,15 @@ workload C, at 506k against 390k for sync.
 
 ## Tests
 
-`ctest --test-dir build` runs 66 doctest cases with the io_uring backend enabled,
-and 58 without it. The suite covers WAL replay, randomized engine operations
-against `std::map`, crash recovery with SIGKILL, RESP parsing, malformed socket
-input, compaction, concurrent readers, Raft persistence and snapshots, and a
-three-node TCP cluster.
+`ctest --test-dir build` runs 82 doctest cases with the io_uring backend enabled,
+and 74 without it. The suite covers WAL tail repair, randomized engine
+operations against `std::map`, SIGKILL recovery, directory fsync ordering,
+RESP parsing, malformed socket input, compaction, concurrent readers, Raft
+persistence and snapshots, and a three-node TCP cluster.
+
+CI runs the 74-case build, AddressSanitizer with UndefinedBehaviorSanitizer, and
+ThreadSanitizer with io_uring disabled. Run the 82-case io_uring suite on a
+Linux host.
 
 The crash tests use SIGKILL, which does not test power loss. The Raft tests use
 sleeps and are timing-sensitive.
@@ -140,6 +151,6 @@ sleeps and are timing-sensitive.
 ## Docs
 
 - [DESIGN.md](DESIGN.md): design notes and the backend contract.
-- [docs/AUDIT.md](docs/AUDIT.md): findings with severity and repros.
+- [docs/AUDIT.md](docs/AUDIT.md): the original findings and their remediation.
 - [docs/figures/README.md](docs/figures/README.md): figure source and render
   command.

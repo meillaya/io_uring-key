@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -75,49 +76,75 @@ public:
 
     Status Put(std::string_view key, std::string_view value) {
         std::lock_guard lock(write_mu_);
+        return PutLocked(key, value);
+    }
 
-        // Write to WAL first.
-        WALRecord rec{WALRecordType::kPut, std::string(key), std::string(value)};
-        auto s = wal_.Append(rec);
+    // Put only when the key is absent. The check and the write share one write
+    // lock, so two clients cannot both observe "absent" and both succeed.
+    Status PutIfAbsent(std::string_view key, std::string_view value, bool* inserted) {
+        std::lock_guard lock(write_mu_);
+        std::optional<std::string> existing;
+        auto s = Get(key, &existing);
+        if (!s.ok()) return s;
+        if (existing.has_value()) {
+            if (inserted) *inserted = false;
+            return Status::OK();
+        }
+        auto write_status = PutLocked(key, value);
+        if (inserted) *inserted = write_status.ok();
+        return write_status;
+    }
+
+    // Put only when the key exists. Same lock discipline as PutIfAbsent.
+    Status PutIfPresent(std::string_view key, std::string_view value, bool* inserted) {
+        std::lock_guard lock(write_mu_);
+        std::optional<std::string> existing;
+        auto s = Get(key, &existing);
+        if (!s.ok()) return s;
+        if (!existing.has_value()) {
+            if (inserted) *inserted = false;
+            return Status::OK();
+        }
+        auto write_status = PutLocked(key, value);
+        if (inserted) *inserted = write_status.ok();
+        return write_status;
+    }
+
+    // Apply a batch of puts under one write lock and one WAL append. This is
+    // the backing operation for MSET: other clients cannot observe a partial
+    // batch, and one failed write rejects the whole call.
+    Status PutBatch(const std::vector<std::pair<std::string, std::string>>& entries) {
+        if (entries.empty()) return Status::OK();
+
+        std::lock_guard lock(write_mu_);
+
+        std::vector<WALRecord> records;
+        records.reserve(entries.size());
+        for (auto& [key, value] : entries) {
+            records.push_back({WALRecordType::kPut, key, value});
+        }
+
+        auto s = wal_.AppendBatch(records);
         if (!s.ok()) return s;
         if (opts_.sync_wal) {
             s = wal_.Sync();
             if (!s.ok()) return s;
         }
 
-        // Write to memtable.
         auto mt = memtable_.load(std::memory_order_acquire);
-        mt->Put(key, value);
+        mt->PutBatch(entries);
+        MarkDirty();
 
-        // Check if memtable needs flushing.
         if (mt->ShouldFlush(opts_.memtable_flush_threshold)) {
-            s = FlushMemtable();
+            s = FlushMemtableLocked();
             if (!s.ok()) return s;
         }
-
         return Status::OK();
     }
 
     Status Delete(std::string_view key) {
         std::lock_guard lock(write_mu_);
-
-        WALRecord rec{WALRecordType::kDelete, std::string(key), ""};
-        auto s = wal_.Append(rec);
-        if (!s.ok()) return s;
-        if (opts_.sync_wal) {
-            s = wal_.Sync();
-            if (!s.ok()) return s;
-        }
-
-        auto mt = memtable_.load(std::memory_order_acquire);
-        mt->Delete(key);
-
-        if (mt->ShouldFlush(opts_.memtable_flush_threshold)) {
-            s = FlushMemtable();
-            if (!s.ok()) return s;
-        }
-
-        return Status::OK();
+        return DeleteLocked(key);
     }
 
     // Authoritative read path (G008): distinguishes "not found" from
@@ -164,32 +191,73 @@ public:
         return out;
     }
 
-    // Count of live (non-tombstoned) keys across memtable + SSTables.
-    // Newest version wins; used by DBSIZE.
-    [[nodiscard]] size_t DbSize() {
-        std::map<std::string, bool> live;  // key -> is_live (first/newest wins)
-        auto mt = memtable_.load(std::memory_order_acquire);
-        mt->ForEach([&](const MemtableEntry& e) {
-            live.emplace(e.key, !e.is_tombstone);
-        });
-        std::lock_guard lock(sst_mu_);
-        for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
-            auto* reader = it->reader.get();
-            (void)reader->ForEach([&](const SSTableEntry& e) -> bool {
-                live.emplace(e.key, !e.is_tombstone);
-                return true;
-            });
+    // Count live (non-tombstoned) keys across the memtable and SSTables.
+    // The count is cached until the next write, so repeated DBSIZE calls do
+    // not rescan every table.
+    Status DbSize(size_t* out) {
+        if (!size_dirty_.load(std::memory_order_acquire)) {
+            if (out) *out = cached_size_.load(std::memory_order_relaxed);
+            return Status::OK();
         }
-        size_t count = 0;
-        for (auto& [k, is_live] : live) {
-            if (is_live) count++;
+
+        std::lock_guard wlock(write_mu_);
+        if (!size_dirty_.load(std::memory_order_acquire)) {
+            if (out) *out = cached_size_.load(std::memory_order_relaxed);
+            return Status::OK();
         }
-        return count;
+
+        std::vector<std::string> keys;
+        auto s = CollectLiveKeysLocked(&keys);
+        if (!s.ok()) return s;
+
+        if (out) *out = keys.size();
+        cached_size_.store(keys.size(), std::memory_order_relaxed);
+        size_dirty_.store(false, std::memory_order_release);
+        return Status::OK();
     }
 
-    // FLUSHDB (G008): delete ALL data — clear the active memtable, remove every
-    // SSTable file, and truncate the WAL. Scoped to this engine's data dir only.
-    // After this, DbSize() == 0 and previously written keys are gone.
+    [[nodiscard]] size_t DbSize() {
+        size_t count = 0;
+        auto s = DbSize(&count);
+        return s.ok() ? count : 0;
+    }
+
+    // Snapshot of all live keys, newest version wins. Used by SCAN.
+    Status Keys(std::vector<std::string>* out) {
+        std::lock_guard wlock(write_mu_);
+        return CollectLiveKeysLocked(out);
+    }
+
+    // Read up to `limit` live keys at or after `start`, in key order. Used by
+    // the short-range scan workload.
+    Status Scan(std::string_view start, size_t limit,
+                std::vector<std::pair<std::string, std::string>>* out) {
+        if (out == nullptr) return Status::InvalidArgument("scan output is null");
+        std::lock_guard wlock(write_mu_);
+        out->clear();
+        if (limit == 0) return Status::OK();
+
+        std::vector<std::string> keys;
+        auto s = CollectLiveKeysLocked(&keys);
+        if (!s.ok()) return s;
+
+        auto it = std::lower_bound(keys.begin(), keys.end(), start,
+                                   [](const std::string& key, std::string_view value) {
+                                       return key < value;
+                                   });
+        for (; it != keys.end() && out->size() < limit; ++it) {
+            std::optional<std::string> value;
+            s = Get(*it, &value);
+            if (!s.ok()) return s;
+            if (value.has_value()) {
+                out->emplace_back(*it, std::move(*value));
+            }
+        }
+        return Status::OK();
+    }
+
+    // FLUSHDB (G008): delete ALL data. Clear the active memtable, remove every
+    // SSTable file, and truncate the WAL. Scoped to this engine's data dir.
     Status Clear() {
         std::lock_guard wlock(write_mu_);
 
@@ -207,15 +275,27 @@ public:
         for (auto& path : paths) {
             auto s = backend_->Delete(path);
             if (!s.ok()) {
-                KV_LOG_WARN("Clear: failed to delete %s: %s",
-                            path.c_str(), s.ToString().c_str());
+                MarkDirty();
+                return s;
             }
         }
 
-        // 3. Truncate the WAL so recovery does not resurrect the cleared keys.
-        auto s = wal_.Truncate();
-        if (!s.ok()) return s;
+        // 3. The unlinks are only durable after the directory is synced.
+        auto s = backend_->SyncDirectory(opts_.data_dir);
+        if (!s.ok()) {
+            MarkDirty();
+            return s;
+        }
 
+        // 4. Truncate the WAL so recovery does not resurrect the cleared keys.
+        s = wal_.Truncate();
+        if (!s.ok()) {
+            MarkDirty();
+            return s;
+        }
+
+        cached_size_.store(0, std::memory_order_relaxed);
+        size_dirty_.store(false, std::memory_order_release);
         KV_LOG_WARN("Clear: flushed all engine data (%zu SSTables removed)", paths.size());
         return Status::OK();
     }
@@ -226,141 +306,16 @@ public:
         return sstables_.size();
     }
 
-    // Flush memtable to a new SSTable.
+    // Force the current memtable to an SSTable.
     Status FlushMemtable() {
-        auto mt = memtable_.load(std::memory_order_acquire);
-        auto entries_vec = mt->Entries();
-        if (entries_vec.empty()) return Status::OK();
-
-        // Convert to SSTable entries.
-        std::vector<SSTableEntry> sst_entries;
-        sst_entries.reserve(entries_vec.size());
-        for (auto& e : entries_vec) {
-            sst_entries.push_back({e.key, e.value, e.is_tombstone});
-        }
-
-        // Generate SSTable filename.
-        uint64_t seq = next_sst_seq_.fetch_add(1);
-        std::string sst_path = opts_.data_dir + "/sst_" + std::to_string(seq) + ".sst";
-
-        // Write SSTable.
-        SSTableWriter writer(backend_.get(), sst_path, opts_.sstable_block_size);
-        auto s = writer.Build(sst_entries);
-        if (!s.ok()) return s;
-
-        // Open the new SSTable for reading.
-        auto reader = std::make_unique<SSTableReader>(backend_.get(), sst_path);
-        s = reader->Open();
-        if (!s.ok()) return s;
-
-        // Real on-disk size (needed for size-tiered compaction grouping).
-        uint64_t file_size = 0;
-        std::error_code ec;
-        auto fsz = std::filesystem::file_size(sst_path, ec);
-        if (!ec) file_size = static_cast<uint64_t>(fsz);
-
-        size_t l0_count = 0;
-        {
-            std::lock_guard lock(sst_mu_);
-            sstables_.push_back({
-                .path = sst_path,
-                .file_size = file_size,
-                .level = 0,
-                .sequence = seq,
-                .reader = std::move(reader),
-            });
-            for (auto& t : sstables_) {
-                if (t.level == 0) l0_count++;
-            }
-        }
-
-        // Truncate WAL and reset memtable (swap in a fresh empty memtable; the
-        // atomic store lets concurrent Get() readers finish on the old table).
-        s = wal_.Truncate();
-        if (!s.ok()) return s;
-
-        memtable_.store(std::make_shared<Memtable>(), std::memory_order_release);
-
-        KV_LOG_INFO("Flushed memtable to %s (%zu entries)", sst_path.c_str(), sst_entries.size());
-
-        // G008: wire compaction into the flush path. Trigger when the level-0
-        // SSTable count exceeds the size-tiered threshold.
-        if (l0_count >= SizeTieredCompaction::kMinTablesForCompaction) {
-            auto cs = MaybeCompact();
-            if (!cs.ok()) return cs;
-        }
-
-        return Status::OK();
-    }
-
-    // Run compaction if needed.
-    Status MaybeCompact() {
-        std::lock_guard lock(sst_mu_);
-
-        std::vector<SSTableMeta> metas;
-        metas.reserve(sstables_.size());
-        for (auto& sst : sstables_) {
-            metas.push_back({sst.path, sst.file_size, sst.level, sst.sequence});
-        }
-
-        auto to_compact = SizeTieredCompaction::PickForCompaction(metas);
-        if (to_compact.empty()) return Status::OK();
-
-        // Collect paths to compact.
-        std::vector<SSTableMeta> inputs;
-        for (size_t idx : to_compact) {
-            inputs.push_back(metas[idx]);
-        }
-
-        uint64_t seq = next_sst_seq_.fetch_add(1);
-        std::string output_path = opts_.data_dir + "/sst_" + std::to_string(seq) + ".sst";
-
-        auto s = SizeTieredCompaction::Merge(backend_.get(), inputs, output_path,
-                                              opts_.sstable_block_size);
-        if (!s.ok()) return s;
-
-        // Open new SSTable.
-        auto reader = std::make_unique<SSTableReader>(backend_.get(), output_path);
-        s = reader->Open();
-        if (!s.ok()) return s;
-
-        // Remove old SSTables and add new one.
-        std::vector<std::string> old_paths;
-        for (size_t idx : to_compact) {
-            old_paths.push_back(metas[idx].path);
-        }
-
-        // Remove old entries.
-        std::erase_if(sstables_, [&](const auto& sst) {
-            return std::find(old_paths.begin(), old_paths.end(), sst.path) != old_paths.end();
-        });
-
-        uint64_t out_size = 0;
-        std::error_code ec;
-        auto fsz = std::filesystem::file_size(output_path, ec);
-        if (!ec) out_size = static_cast<uint64_t>(fsz);
-
-        sstables_.push_back({
-            .path = output_path,
-            .file_size = out_size,
-            .level = 0,
-            .sequence = seq,
-            .reader = std::move(reader),
-        });
-
-        // Delete old files.
-        for (auto& path : old_paths) {
-            backend_->Delete(path);
-        }
-
-        KV_LOG_INFO("Compacted %zu SSTables into %s", to_compact.size(), output_path.c_str());
-        return Status::OK();
+        std::lock_guard lock(write_mu_);
+        return FlushMemtableLocked();
     }
 
     // Force flush + sync (for clean shutdown).
     Status FlushAndSync() {
         std::lock_guard lock(write_mu_);
-        auto s = FlushMemtable();
+        auto s = FlushMemtableLocked();
         if (!s.ok()) return s;
         return wal_.Sync();
     }
@@ -377,34 +332,287 @@ private:
         std::unique_ptr<SSTableReader> reader;
     };
 
+    Status PutLocked(std::string_view key, std::string_view value) {
+        WALRecord rec{WALRecordType::kPut, std::string(key), std::string(value)};
+        auto s = wal_.Append(rec);
+        if (!s.ok()) return s;
+        if (opts_.sync_wal) {
+            s = wal_.Sync();
+            if (!s.ok()) return s;
+        }
+
+        auto mt = memtable_.load(std::memory_order_acquire);
+        mt->Put(key, value);
+        MarkDirty();
+
+        if (mt->ShouldFlush(opts_.memtable_flush_threshold)) {
+            s = FlushMemtableLocked();
+            if (!s.ok()) return s;
+        }
+        return Status::OK();
+    }
+
+    Status DeleteLocked(std::string_view key) {
+        WALRecord rec{WALRecordType::kDelete, std::string(key), ""};
+        auto s = wal_.Append(rec);
+        if (!s.ok()) return s;
+        if (opts_.sync_wal) {
+            s = wal_.Sync();
+            if (!s.ok()) return s;
+        }
+
+        auto mt = memtable_.load(std::memory_order_acquire);
+        mt->Delete(key);
+        MarkDirty();
+
+        if (mt->ShouldFlush(opts_.memtable_flush_threshold)) {
+            s = FlushMemtableLocked();
+            if (!s.ok()) return s;
+        }
+        return Status::OK();
+    }
+
+    // Caller holds write_mu_. The SSTable file is fsynced by the writer, and
+    // the directory is synced here before the WAL is truncated.
+    Status FlushMemtableLocked() {
+        auto mt = memtable_.load(std::memory_order_acquire);
+        auto entries_vec = mt->Entries();
+        if (entries_vec.empty()) return Status::OK();
+
+        std::vector<SSTableEntry> sst_entries;
+        sst_entries.reserve(entries_vec.size());
+        for (auto& e : entries_vec) {
+            sst_entries.push_back({e.key, e.value, e.is_tombstone});
+        }
+
+        uint64_t seq = next_sst_seq_.fetch_add(1);
+        std::string sst_path = opts_.data_dir + "/sst_" + std::to_string(seq) + ".sst";
+        std::string tmp_path = sst_path + ".tmp";
+
+        // Write to a temporary name and rename after the file is fsynced. A
+        // crash mid-write leaves a .tmp file, never a half-valid .sst.
+        SSTableWriter writer(backend_.get(), tmp_path, opts_.sstable_block_size);
+        auto s = writer.Build(sst_entries);
+        if (!s.ok()) return s;
+
+        std::error_code rename_ec;
+        std::filesystem::rename(tmp_path, sst_path, rename_ec);
+        if (rename_ec) {
+            return Status::IOError("rename SSTable " + tmp_path + ": " +
+                                   rename_ec.message());
+        }
+
+        // Make the new directory entry durable before the WAL is truncated.
+        s = backend_->SyncDirectory(opts_.data_dir);
+        if (!s.ok()) return s;
+
+        auto reader = std::make_unique<SSTableReader>(backend_.get(), sst_path);
+        s = reader->Open();
+        if (!s.ok()) return s;
+
+        uint64_t file_size = 0;
+        std::error_code ec;
+        auto fsz = std::filesystem::file_size(sst_path, ec);
+        if (!ec) file_size = static_cast<uint64_t>(fsz);
+
+        size_t table_count = 0;
+        {
+            std::lock_guard lock(sst_mu_);
+            sstables_.push_back({
+                .path = sst_path,
+                .file_size = file_size,
+                .level = 0,
+                .sequence = seq,
+                .reader = std::move(reader),
+            });
+            std::sort(sstables_.begin(), sstables_.end(),
+                      [](const SSTableHandle& a, const SSTableHandle& b) {
+                          return a.sequence < b.sequence;
+                      });
+            table_count = sstables_.size();
+        }
+
+        // The SSTable is durable now, so the WAL can drop these records.
+        s = wal_.Truncate();
+        if (!s.ok()) return s;
+
+        memtable_.store(std::make_shared<Memtable>(), std::memory_order_release);
+        KV_LOG_INFO("Flushed memtable to %s (%zu entries)", sst_path.c_str(),
+                    sst_entries.size());
+
+        if (table_count >= LevelZeroCompaction::kMinTablesForCompaction) {
+            auto cs = MaybeCompactLocked();
+            if (!cs.ok()) return cs;
+        }
+        return Status::OK();
+    }
+
+    // Caller holds write_mu_. Merge every level-0 table. Merging all tables is
+    // what keeps the new output's sequence honest: no older table is left
+    // underneath it to shadow a newer value.
+    Status MaybeCompactLocked() {
+        std::vector<SSTableMeta> inputs;
+        {
+            std::lock_guard lock(sst_mu_);
+            if (sstables_.size() < LevelZeroCompaction::kMinTablesForCompaction) {
+                return Status::OK();
+            }
+            inputs.reserve(sstables_.size());
+            for (auto& sst : sstables_) {
+                inputs.push_back({sst.path, sst.file_size, sst.level, sst.sequence});
+            }
+        }
+
+        uint64_t seq = next_sst_seq_.fetch_add(1);
+        std::string output_path = opts_.data_dir + "/sst_" + std::to_string(seq) + ".sst";
+        std::string tmp_path = output_path + ".tmp";
+
+        // Merge with no SSTable lock held, so readers keep serving the old
+        // tables while the new one is built.
+        auto s = LevelZeroCompaction::Merge(backend_.get(), inputs, tmp_path,
+                                              opts_.sstable_block_size);
+        if (!s.ok()) return s;
+
+        std::error_code rename_ec;
+        std::filesystem::rename(tmp_path, output_path, rename_ec);
+        if (rename_ec) {
+            return Status::IOError("rename SSTable " + tmp_path + ": " +
+                                   rename_ec.message());
+        }
+
+        // Make the merged table durable before deleting its inputs.
+        s = backend_->SyncDirectory(opts_.data_dir);
+        if (!s.ok()) return s;
+
+        auto reader = std::make_unique<SSTableReader>(backend_.get(), output_path);
+        s = reader->Open();
+        if (!s.ok()) return s;
+
+        std::vector<std::string> old_paths;
+        old_paths.reserve(inputs.size());
+        for (auto& input : inputs) old_paths.push_back(input.path);
+
+        uint64_t out_size = 0;
+        std::error_code ec;
+        auto fsz = std::filesystem::file_size(output_path, ec);
+        if (!ec) out_size = static_cast<uint64_t>(fsz);
+
+        {
+            std::lock_guard lock(sst_mu_);
+            std::erase_if(sstables_, [&](const SSTableHandle& sst) {
+                return std::find(old_paths.begin(), old_paths.end(), sst.path) !=
+                       old_paths.end();
+            });
+            sstables_.push_back({
+                .path = output_path,
+                .file_size = out_size,
+                .level = 0,
+                .sequence = seq,
+                .reader = std::move(reader),
+            });
+            std::sort(sstables_.begin(), sstables_.end(),
+                      [](const SSTableHandle& a, const SSTableHandle& b) {
+                          return a.sequence < b.sequence;
+                      });
+        }
+
+        for (auto& path : old_paths) {
+            auto ds = backend_->Delete(path);
+            if (!ds.ok()) return ds;
+        }
+        s = backend_->SyncDirectory(opts_.data_dir);
+        if (!s.ok()) return s;
+
+        KV_LOG_INFO("Compacted %zu SSTables into %s", old_paths.size(),
+                    output_path.c_str());
+        return Status::OK();
+    }
+
+    Status CollectLiveKeysLocked(std::vector<std::string>* out) {
+        std::map<std::string, bool> live;  // key -> is_live, newest wins
+        auto mt = memtable_.load(std::memory_order_acquire);
+        mt->ForEach([&](const MemtableEntry& e) {
+            live.emplace(e.key, !e.is_tombstone);
+        });
+
+        std::lock_guard lock(sst_mu_);
+        for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
+            auto s = it->reader->ForEach([&](const SSTableEntry& e) -> bool {
+                live.emplace(e.key, !e.is_tombstone);
+                return true;
+            });
+            if (!s.ok()) return s;
+        }
+
+        if (out) {
+            out->clear();
+            out->reserve(live.size());
+            for (auto& [key, is_live] : live) {
+                if (is_live) out->push_back(key);
+            }
+        }
+        return Status::OK();
+    }
+
+    void MarkDirty() { size_dirty_.store(true, std::memory_order_release); }
+
     Status LoadSSTables() {
         namespace fs = std::filesystem;
         std::vector<std::pair<uint64_t, std::string>> sst_files;
 
-        for (auto& entry : fs::directory_iterator(opts_.data_dir)) {
-            auto name = entry.path().filename().string();
-            if (name.starts_with("sst_") && name.ends_with(".sst")) {
-                // Extract sequence number.
-                auto seq_str = name.substr(4, name.size() - 8);
-                uint64_t seq = std::stoull(seq_str);
-                sst_files.emplace_back(seq, entry.path().string());
+        std::error_code dir_ec;
+        bool removed_temp = false;
+        for (fs::directory_iterator it(opts_.data_dir, dir_ec), end; it != end;
+             it.increment(dir_ec)) {
+            auto name = it->path().filename().string();
+            if (name.starts_with("sst_") && name.ends_with(".sst.tmp")) {
+                // A crash interrupted a flush or compaction. The WAL or the old
+                // tables still own this data, so the temp file is garbage.
+                auto removed = backend_->Delete(it->path().string());
+                if (removed.ok()) removed_temp = true;
+                continue;
             }
+            if (!name.starts_with("sst_") || !name.ends_with(".sst")) continue;
+
+            auto seq_str = name.substr(4, name.size() - 8);
+            uint64_t seq = 0;
+            auto [ptr, ec] = std::from_chars(seq_str.data(),
+                                             seq_str.data() + seq_str.size(), seq);
+            if (ec != std::errc() || ptr != seq_str.data() + seq_str.size()) {
+                KV_LOG_WARN("Ignoring SSTable with an invalid sequence: %s",
+                            it->path().c_str());
+                continue;
+            }
+            sst_files.emplace_back(seq, it->path().string());
+        }
+        if (dir_ec) {
+            return Status::IOError("scan data dir: " + dir_ec.message());
+        }
+        if (removed_temp) {
+            auto sync_status = backend_->SyncDirectory(opts_.data_dir);
+            if (!sync_status.ok()) return sync_status;
         }
 
-        // Sort by sequence (oldest first).
         std::sort(sst_files.begin(), sst_files.end());
 
         for (auto& [seq, path] : sst_files) {
             auto reader = std::make_unique<SSTableReader>(backend_.get(), path);
             auto s = reader->Open();
             if (!s.ok()) {
-                KV_LOG_WARN("Failed to open SSTable %s: %s", path.c_str(), s.ToString().c_str());
-                continue;
+                return Status::Corruption("open SSTable " + path + ": " +
+                                          s.ToString());
             }
-            uint64_t file_size = fs::file_size(path);
+
+            std::error_code size_ec;
+            auto file_size = fs::file_size(path, size_ec);
+            if (size_ec) {
+                return Status::IOError("stat SSTable " + path + ": " +
+                                       size_ec.message());
+            }
+
             sstables_.push_back({
                 .path = path,
-                .file_size = file_size,
+                .file_size = static_cast<uint64_t>(file_size),
                 .level = 0,
                 .sequence = seq,
                 .reader = std::move(reader),
@@ -428,6 +636,8 @@ private:
     std::mutex write_mu_;
     std::mutex sst_mu_;
     std::atomic<uint64_t> next_sst_seq_{0};
+    std::atomic<bool> size_dirty_{true};
+    std::atomic<size_t> cached_size_{0};
 };
 
 } // namespace kv

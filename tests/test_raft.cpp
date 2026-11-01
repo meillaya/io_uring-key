@@ -450,8 +450,9 @@ TEST_CASE("raft: snapshot-base safety (stale snapshot rejected, outdated candida
     equal.last_included_term = 5;
     equal.data = {{"alpha", "STALE"}};
     auto equal_reply = node.HandleInstallSnapshot(equal);
-    CHECK(!equal_reply.success);
+    CHECK(equal_reply.success);
     CHECK(node.last_included_index() == 100);
+    CHECK(node.state_machine_copy()["alpha"] == "1");
 
     // (a) A candidate whose log is BEHIND the snapshot base must NOT be granted
     //     a vote by this up-to-date node. Before the fix the compacted node

@@ -13,6 +13,7 @@
 #include <unordered_map>
 
 #include "io/io_backend.h"
+#include "util/fs.h"
 
 namespace kv {
 
@@ -75,6 +76,22 @@ public:
         *size = static_cast<uint64_t>(st.st_size);
         it->second.file_size = *size;
         return Status::OK();
+    }
+
+    Status Truncate(FileHandle fh, uint64_t size) override {
+        std::lock_guard lock(mu_);
+        auto it = files_.find(fh);
+        if (it == files_.end()) return Status::InvalidArgument("invalid file handle");
+        if (::ftruncate(it->second.fd, static_cast<off_t>(size)) != 0) {
+            return Status::IOError(std::string("ftruncate: ") + std::strerror(errno));
+        }
+        UnmapLocked(it->second);
+        it->second.file_size = size;
+        return Status::OK();
+    }
+
+    Status SyncDirectory(std::string_view path) override {
+        return SyncDirectoryPath(path);
     }
 
     Status Read(FileHandle fh, uint64_t offset, void* buf, size_t len) override {

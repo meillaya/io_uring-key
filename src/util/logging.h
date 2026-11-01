@@ -1,6 +1,7 @@
 #pragma once
 // Minimal logging for the KV engine.
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <source_location>
@@ -10,12 +11,14 @@ namespace kv {
 
 enum class LogLevel : int { kDebug = 0, kInfo = 1, kWarn = 2, kError = 3 };
 
-inline LogLevel& GlobalLogLevel() {
-    static LogLevel level = LogLevel::kInfo;
+inline std::atomic<LogLevel>& GlobalLogLevel() {
+    static std::atomic<LogLevel> level = LogLevel::kInfo;
     return level;
 }
 
-inline void SetLogLevel(LogLevel level) { GlobalLogLevel() = level; }
+inline void SetLogLevel(LogLevel level) {
+    GlobalLogLevel().store(level, std::memory_order_relaxed);
+}
 
 inline const char* LevelName(LogLevel level) {
     switch (level) {
@@ -30,7 +33,7 @@ inline const char* LevelName(LogLevel level) {
 // printf-style logging with source location.
 template <typename... Args>
 void Log(LogLevel level, std::source_location loc, const char* fmt, Args... args) {
-    if (level < GlobalLogLevel()) return;
+    if (level < GlobalLogLevel().load(std::memory_order_relaxed)) return;
     // Extract filename from path
     const char* file = loc.file_name();
     if (const char* slash = std::strrchr(file, '/')) file = slash + 1;

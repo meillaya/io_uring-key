@@ -271,7 +271,7 @@ def architecture() -> dict:
                 40,
                 855,
                 900,
-                "Source: src/main.cpp, src/server, src/engine, src/io; commit 30c7365.",
+                "Source: src/main.cpp, src/server, src/engine, src/io.",
                 align="left",
             ),
         ]

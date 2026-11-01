@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -30,13 +31,38 @@ int main(int argc, char* argv[]) {
     std::string output_csv = "benchmark_results.csv";
     size_t num_keys = 10000;
     size_t num_ops = 50000;
+    bool sync_wal = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--output" && i + 1 < argc) output_csv = argv[++i];
-        else if (arg == "--keys" && i + 1 < argc) num_keys = std::stoul(argv[++i]);
-        else if (arg == "--ops" && i + 1 < argc) num_ops = std::stoul(argv[++i]);
+        if (arg == "--output" && i + 1 < argc) {
+            output_csv = argv[++i];
+        } else if (arg == "--keys" && i + 1 < argc) {
+            try {
+                num_keys = std::stoul(argv[++i]);
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --keys\n");
+                return 1;
+            }
+        } else if (arg == "--ops" && i + 1 < argc) {
+            try {
+                num_ops = std::stoul(argv[++i]);
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --ops\n");
+                return 1;
+            }
+        } else if (arg == "--sync-wal") {
+            sync_wal = true;
+        } else if (arg == "--no-sync-wal") {
+            sync_wal = false;
+        } else {
+            std::fprintf(stderr, "Unknown or incomplete option: %s\n", arg.c_str());
+            return 1;
+        }
     }
+
+    std::printf("YCSB run: keys=%zu ops=%zu sync_wal=%s\n",
+                num_keys, num_ops, sync_wal ? "true" : "false");
 
     std::ofstream csv(output_csv);
     YCSBBenchmark::WriteCSVHeader(csv);
@@ -54,7 +80,7 @@ int main(int argc, char* argv[]) {
             EngineOptions opts;
             opts.data_dir = data_dir;
             opts.memtable_flush_threshold = 4 * 1024 * 1024;
-            opts.sync_wal = false;  // Benchmark mode: no fsync per write.
+            opts.sync_wal = sync_wal;
 
             Engine engine(std::move(backend), opts);
             if (!engine.Open().ok()) {
@@ -68,6 +94,7 @@ int main(int argc, char* argv[]) {
             config.workload = wl;
             config.num_keys = num_keys;
             config.num_ops = num_ops;
+            config.sync_wal = sync_wal;
 
             auto result = bench.Run(config);
             YCSBBenchmark::ExportCSV(result, csv);
@@ -88,7 +115,10 @@ int main(int argc, char* argv[]) {
 #ifdef KV_HAS_IOURING
     run_backend("io_uring", [] {
         auto b = std::make_unique<IOUringBackend>();
-        b->Init();
+        auto s = b->Init();
+        if (!s.ok()) {
+            std::fprintf(stderr, "io_uring init failed: %s\n", s.ToString().c_str());
+        }
         return b;
     });
 #endif

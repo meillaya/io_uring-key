@@ -53,6 +53,15 @@ public:
         InsertInternal(std::string(key), "", true);
     }
 
+    // Apply a group of puts while holding the read-write lock once. Readers
+    // see either the whole batch or none of it.
+    void PutBatch(const std::vector<std::pair<std::string, std::string>>& entries) {
+        std::unique_lock lock(rw_);
+        for (auto& [key, value] : entries) {
+            InsertInternal(key, value, false);
+        }
+    }
+
     // Get a value by key.
     // Returns: nullopt if not found, {value, is_tombstone} if found.
     std::optional<std::pair<std::string, bool>> Get(std::string_view key) const {

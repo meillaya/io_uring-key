@@ -1,5 +1,5 @@
 #pragma once
-// Size-tiered compaction: merge SSTables of similar size into larger ones.
+// Level-0 compaction: merge all tables into one when the count hits four.
 
 #include <algorithm>
 #include <cstdint>
@@ -23,48 +23,12 @@ struct SSTableMeta {
     uint64_t sequence;  // Creation order (newer = higher).
 };
 
-// Size-tiered compaction policy.
-class SizeTieredCompaction {
+// Level-0 compaction policy. The trigger is a table count; the action is a
+// full merge. Merging every table keeps the output's sequence honest, because
+// no older table remains underneath it to shadow a newer value.
+class LevelZeroCompaction {
 public:
     static constexpr size_t kMinTablesForCompaction = 4;
-    static constexpr double kSizeRatioThreshold = 2.0;
-
-    // Select tables for compaction: group tables of similar size.
-    // Returns indices into the input vector that should be compacted together.
-    static std::vector<size_t> PickForCompaction(const std::vector<SSTableMeta>& tables) {
-        if (tables.size() < kMinTablesForCompaction) return {};
-
-        // Sort by size for grouping.
-        std::vector<size_t> indices(tables.size());
-        for (size_t i = 0; i < tables.size(); i++) indices[i] = i;
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            return tables[a].file_size < tables[b].file_size;
-        });
-
-        // Find the largest group of similar-sized tables.
-        std::vector<size_t> best_group;
-        size_t i = 0;
-        while (i < indices.size()) {
-            std::vector<size_t> group = {indices[i]};
-            uint64_t base_size = tables[indices[i]].file_size;
-            size_t j = i + 1;
-            while (j < indices.size()) {
-                uint64_t sz = tables[indices[j]].file_size;
-                if (base_size > 0 && static_cast<double>(sz) / base_size <= kSizeRatioThreshold) {
-                    group.push_back(indices[j]);
-                    j++;
-                } else {
-                    break;
-                }
-            }
-            if (group.size() > best_group.size() && group.size() >= kMinTablesForCompaction) {
-                best_group = group;
-            }
-            i = j;
-        }
-
-        return best_group;
-    }
 
     // Merge multiple SSTables into one output SSTable.
     // Later tables (higher sequence) take precedence for duplicate keys.
@@ -92,10 +56,8 @@ public:
             if (!s.ok()) return s;
         }
 
-        // Remove tombstones that have no older version beneath them
-        // (i.e., tombstones at the bottom level can be dropped).
-        // For size-tiered, we keep tombstones unless this is the only level.
-        // Simple policy: keep all entries including tombstones.
+        // Keep every entry, including tombstones. A tombstone is cheap compared
+        // with the risk of resurrecting a key when the merge set changes.
 
         // Build sorted output.
         std::vector<SSTableEntry> entries;

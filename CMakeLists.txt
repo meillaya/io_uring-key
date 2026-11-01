@@ -10,6 +10,22 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
 option(KV_BUILD_BENCH "Build benchmarks" ON)
 option(KV_USE_IOURING "Enable io_uring backend" ON)
+option(KV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(KV_TSAN "Build with ThreadSanitizer" OFF)
+
+if(KV_SANITIZE AND KV_TSAN)
+  message(FATAL_ERROR "KV_SANITIZE and KV_TSAN are mutually exclusive")
+endif()
+
+if(KV_SANITIZE)
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(KV_TSAN)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+endif()
 
 if(KV_USE_IOURING)
   find_package(PkgConfig REQUIRED)
@@ -20,8 +36,8 @@ include(FetchContent)
 FetchContent_Declare(
   doctest
   GIT_REPOSITORY https://github.com/doctest/doctest.git
-  GIT_TAG        v2.4.11
-  GIT_SHALLOW    TRUE
+  # v2.4.11, pinned to the commit so a retagged release cannot change the build.
+  GIT_TAG        ae7a13539fb71f270b87eb2e874fbac80bc8dda2
 )
 FetchContent_MakeAvailable(doctest)
 
@@ -46,7 +62,6 @@ endif()
 enable_testing()
 add_executable(kv_tests
   tests/test_main.cpp
-  tests/test_hello.cpp
   tests/test_util.cpp
   tests/test_differential.cpp
   tests/test_wal_recovery.cpp
@@ -59,6 +74,7 @@ add_executable(kv_tests
   tests/test_engine_features.cpp
   tests/test_concurrency.cpp
   tests/test_raft_tcp.cpp
+  tests/test_remediation.cpp
 )
 target_link_libraries(kv_tests PRIVATE kv_core doctest::doctest)
 

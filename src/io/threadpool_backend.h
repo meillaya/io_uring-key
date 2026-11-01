@@ -47,6 +47,19 @@ public:
         return sync_->FileSize(fh, size);
     }
 
+    Status Truncate(FileHandle fh, uint64_t size) override {
+        return Dispatch([this, fh, size] {
+            return sync_->Truncate(fh, size);
+        });
+    }
+
+    Status SyncDirectory(std::string_view path) override {
+        std::string owned(path);
+        return Dispatch([this, owned = std::move(owned)] {
+            return sync_->SyncDirectory(owned);
+        });
+    }
+
     Status Read(FileHandle fh, uint64_t offset, void* buf, size_t len) override {
         return Dispatch([this, fh, offset, buf, len] {
             return sync_->Read(fh, offset, buf, len);

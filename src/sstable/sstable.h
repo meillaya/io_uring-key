@@ -92,6 +92,7 @@ public:
     }
 
     [[nodiscard]] bool MayContain(std::string_view key) const {
+        if (num_bits_ == 0 || num_hashes_ == 0) return false;
         uint64_t h = Hash(key);
         for (size_t i = 0; i < num_hashes_; i++) {
             uint64_t bit = (h + i * 0x9E3779B97F4A7C15ULL) % num_bits_;
@@ -113,15 +114,32 @@ public:
         return data;
     }
 
-    static BloomFilter Deserialize(const uint8_t* data, size_t len) {
-        BloomFilter bf;
-        if (len < 12) return bf;
-        std::memcpy(&bf.num_bits_, data, 4);
-        std::memcpy(&bf.num_hashes_, data + 4, 4);
-        size_t bytes = (bf.num_bits_ + 7) / 8;
-        if (8 + bytes + 4 > len) return bf;
-        bf.bits_.assign(data + 8, data + 8 + bytes);
-        return bf;
+    // Parse and validate a serialized bloom filter. The caller must pass the
+    // full block including the trailing CRC. A zero bit count or hash count is
+    // invalid and would make MayContain divide by zero.
+    static bool Deserialize(const uint8_t* data, size_t len, BloomFilter* out) {
+        if (out == nullptr) return false;
+        if (len < 12) return false;
+
+        uint32_t num_bits = 0;
+        uint32_t num_hashes = 0;
+        std::memcpy(&num_bits, data, 4);
+        std::memcpy(&num_hashes, data + 4, 4);
+        if (num_bits == 0 || num_hashes == 0 || num_hashes > 64) return false;
+
+        size_t bytes = (static_cast<size_t>(num_bits) + 7) / 8;
+        if (bytes > (size_t{1} << 30)) return false;  // 128 MiB of bits
+        if (8 + bytes + 4 != len) return false;
+
+        uint32_t stored_crc = 0;
+        std::memcpy(&stored_crc, data + 8 + bytes, 4);
+        uint32_t computed_crc = CRC32::Compute(data, 8 + bytes);
+        if (stored_crc != computed_crc) return false;
+
+        out->num_bits_ = num_bits;
+        out->num_hashes_ = num_hashes;
+        out->bits_.assign(data + 8, data + 8 + bytes);
+        return true;
     }
 
 private:
@@ -305,7 +323,7 @@ public:
         auto s = backend_->Open(path_, false, false, &fh_);
         if (!s.ok()) return s;
 
-        uint64_t file_size;
+        uint64_t file_size = 0;
         s = backend_->FileSize(fh_, &file_size);
         if (!s.ok()) { backend_->Close(fh_); return s; }
 
@@ -314,21 +332,18 @@ public:
             return Status::Corruption("SSTable too small");
         }
 
-        // Read footer.
         uint8_t footer[kFooterSize];
         s = backend_->Read(fh_, file_size - kFooterSize, footer, kFooterSize);
         if (!s.ok()) { backend_->Close(fh_); return s; }
 
-        // Verify magic.
-        uint64_t magic;
+        uint64_t magic = 0;
         std::memcpy(&magic, footer + 32, 8);
         if (magic != kSSTableMagic) {
             backend_->Close(fh_);
             return Status::Corruption("bad SSTable magic");
         }
 
-        // Verify footer CRC.
-        uint32_t stored_crc;
+        uint32_t stored_crc = 0;
         std::memcpy(&stored_crc, footer + 40, 4);
         uint32_t computed_crc = CRC32::Compute(footer, 40);
         if (stored_crc != computed_crc) {
@@ -342,37 +357,78 @@ public:
         std::memcpy(&bloom_size_, footer + 20, 4);
         std::memcpy(&data_size_, footer + 24, 8);
 
-        // Load bloom filter.
+        const uint64_t footer_start = file_size - kFooterSize;
+        auto fits = [&](uint64_t offset, uint64_t size) {
+            return offset <= footer_start && size <= footer_start - offset;
+        };
+
+        if (index_size_ < 8 || bloom_size_ < 12 ||
+            !fits(index_offset_, index_size_) ||
+            !fits(bloom_offset_, bloom_size_) ||
+            data_size_ > index_offset_ ||
+            index_offset_ > bloom_offset_ ||
+            index_size_ > bloom_offset_ - index_offset_) {
+            backend_->Close(fh_);
+            return Status::Corruption("invalid SSTable footer offsets");
+        }
+
         std::vector<uint8_t> bloom_data(bloom_size_);
         s = backend_->Read(fh_, bloom_offset_, bloom_data.data(), bloom_size_);
         if (!s.ok()) { backend_->Close(fh_); return s; }
-        bloom_ = BloomFilter::Deserialize(bloom_data.data(), bloom_data.size());
+        if (!BloomFilter::Deserialize(bloom_data.data(), bloom_data.size(), &bloom_)) {
+            backend_->Close(fh_);
+            return Status::Corruption("invalid bloom filter");
+        }
 
-        // Load index.
         std::vector<uint8_t> index_data(index_size_);
         s = backend_->Read(fh_, index_offset_, index_data.data(), index_size_);
         if (!s.ok()) { backend_->Close(fh_); return s; }
 
-        // Parse index.
-        if (index_data.size() < 4) {
+        uint32_t index_crc = 0;
+        std::memcpy(&index_crc, index_data.data() + index_data.size() - 4, 4);
+        uint32_t index_computed = CRC32::Compute(index_data.data(), index_data.size() - 4);
+        if (index_crc != index_computed) {
             backend_->Close(fh_);
-            return Status::Corruption("index too small");
+            return Status::Corruption("index CRC mismatch");
         }
-        uint32_t num_entries;
+
+        uint32_t num_entries = 0;
         std::memcpy(&num_entries, index_data.data(), 4);
         size_t pos = 4;
+        index_.clear();
         for (uint32_t i = 0; i < num_entries; i++) {
-            if (pos + 4 > index_data.size()) break;
-            uint32_t klen;
-            std::memcpy(&klen, index_data.data() + pos, 4); pos += 4;
-            if (pos + klen + 12 > index_data.size()) break;
+            if (pos + 4 > index_data.size() - 4) {
+                backend_->Close(fh_);
+                return Status::Corruption("truncated index entry");
+            }
+            uint32_t klen = 0;
+            std::memcpy(&klen, index_data.data() + pos, 4);
+            pos += 4;
+            if (klen > index_data.size() - 4 - pos ||
+                pos + klen + 12 > index_data.size() - 4) {
+                backend_->Close(fh_);
+                return Status::Corruption("invalid index key length");
+            }
             std::string key(reinterpret_cast<const char*>(index_data.data() + pos), klen);
             pos += klen;
-            uint64_t off;
-            std::memcpy(&off, index_data.data() + pos, 8); pos += 8;
-            uint32_t sz;
-            std::memcpy(&sz, index_data.data() + pos, 4); pos += 4;
+
+            uint64_t off = 0;
+            std::memcpy(&off, index_data.data() + pos, 8);
+            pos += 8;
+            uint32_t sz = 0;
+            std::memcpy(&sz, index_data.data() + pos, 4);
+            pos += 4;
+
+            if (sz < 8 || off > data_size_ || sz > data_size_ - off) {
+                backend_->Close(fh_);
+                return Status::Corruption("index points outside data blocks");
+            }
             index_.push_back({std::move(key), off, sz});
+        }
+
+        if (pos != index_data.size() - 4) {
+            backend_->Close(fh_);
+            return Status::Corruption("index size does not match entry count");
         }
 
         return Status::OK();
@@ -422,7 +478,7 @@ public:
         }
 
         // Verify block CRC.
-        if (block_data.size() < 4) {
+        if (block_data.size() < 8) {
             return Status::Corruption("block too small");
         }
         uint32_t stored_crc;
@@ -468,34 +524,58 @@ public:
     // Iterate all entries in the SSTable.
     Status ForEach(const std::function<bool(const SSTableEntry&)>& cb) const {
         for (auto& [last_key, block_offset, block_size] : index_) {
+            if (block_size < 8) return Status::Corruption("block too small");
             std::vector<uint8_t> block_data(block_size);
             auto s = backend_->Read(fh_, block_offset, block_data.data(), block_size);
             if (!s.ok()) return s;
 
-            // Verify CRC.
-            uint32_t stored_crc;
+            uint32_t stored_crc = 0;
             std::memcpy(&stored_crc, block_data.data() + block_data.size() - 4, 4);
             uint32_t computed_crc = CRC32::Compute(block_data.data(), block_data.size() - 4);
             if (stored_crc != computed_crc) {
                 return Status::Corruption("block CRC mismatch");
             }
 
-            uint32_t num_entries;
+            uint32_t num_entries = 0;
             std::memcpy(&num_entries, block_data.data(), 4);
             size_t pos = 4;
             for (uint32_t i = 0; i < num_entries; i++) {
+                if (pos + 4 > block_data.size() - 4) {
+                    return Status::Corruption("truncated entry key length");
+                }
+                uint32_t klen = 0;
+                std::memcpy(&klen, block_data.data() + pos, 4);
+                pos += 4;
+                if (klen > block_data.size() - 4 - pos) {
+                    return Status::Corruption("invalid entry key length");
+                }
+
                 SSTableEntry entry;
-                uint32_t klen;
-                std::memcpy(&klen, block_data.data() + pos, 4); pos += 4;
                 entry.key.assign(reinterpret_cast<const char*>(block_data.data() + pos), klen);
                 pos += klen;
-                entry.is_tombstone = block_data[pos] != 0; pos += 1;
-                uint32_t vlen;
-                std::memcpy(&vlen, block_data.data() + pos, 4); pos += 4;
+
+                if (pos >= block_data.size() - 4) {
+                    return Status::Corruption("truncated tombstone flag");
+                }
+                entry.is_tombstone = block_data[pos] != 0;
+                pos += 1;
+
+                if (pos + 4 > block_data.size() - 4) {
+                    return Status::Corruption("truncated entry value length");
+                }
+                uint32_t vlen = 0;
+                std::memcpy(&vlen, block_data.data() + pos, 4);
+                pos += 4;
+                if (vlen > block_data.size() - 4 - pos) {
+                    return Status::Corruption("invalid entry value length");
+                }
                 entry.value.assign(reinterpret_cast<const char*>(block_data.data() + pos), vlen);
                 pos += vlen;
 
                 if (!cb(entry)) return Status::OK();
+            }
+            if (pos != block_data.size() - 4) {
+                return Status::Corruption("block size does not match entry count");
             }
         }
         return Status::OK();

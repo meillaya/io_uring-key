@@ -1,15 +1,15 @@
 # kernel-v2 design document
 
-> Status: implementation notes from G0 to G8. The server does not start the
-> Raft library, and the benchmark disables WAL fsync. See
-> [docs/AUDIT.md](docs/AUDIT.md) for open correctness gaps.
+> Status: implementation notes from G0 to G10. The server does not start the
+> Raft library. The benchmark skips WAL fsync by default and `--sync-wal`
+> enables it. See [docs/AUDIT.md](docs/AUDIT.md) for the audit and remediation.
 
 ## Overview
 
 A log-structured key-value store in C++23 with:
-- WAL + skip-list memtable + SSTables + size-tiered compaction (LSM-tree).
+- WAL + skip-list memtable + SSTables + level-0 full compaction (LSM-tree).
 - Four interchangeable I/O backends (sync, threadpool, mmap, io_uring).
-- Redis-compatible RESP2 API over TCP (hardened parser).
+- RESP2 API over TCP with a bounded command set and a hardened parser.
 - Raft library (standalone, not used by the server): election, log
   replication, **persistent log + snapshots**, and a **real TCP transport**
   (POSIX sockets).
@@ -51,21 +51,23 @@ library, not part of the server path. `kv_server` never starts it.
 | wal | `src/wal/` | Write-ahead log: group commit, CRC, replay, torn-write |
 | memtable | `src/memtable/` | Concurrent skip list |
 | sstable | `src/sstable/` | Sorted runs, sparse index, bloom filter, blocks |
-| compaction | `src/compaction/` | Size-tiered compaction |
-| io | `src/io/` | I/O backend interface (FROZEN) + 4 implementations |
+| compaction | `src/compaction/` | Level-0 full merge |
+| io | `src/io/` | I/O backend interface + 4 implementations |
 | engine | `src/engine/` | LSM engine: Get/Put/Delete, flush, compaction, recovery |
 | server | `src/server/` | RESP2 protocol + hardened parser + command dispatch + TCP server |
 | raft | `src/raft/` | Raft-lite: election, replication, persistent log, snapshots, TCP transport |
 | bench | `src/bench/` | YCSB workload generator + latency capture + CSV |
 
-## I/O Backend Contract (FROZEN at end of G1)
+## I/O Backend Contract
 
 `io_backend.h` is the single I/O abstraction. All four backends implement the
 same interface; the engine/WAL/SSTable layers only touch I/O through it.
 
 Interface methods:
 - `Open/Close/Delete/FileSize`: file lifecycle.
+- `Truncate`: cut a torn WAL tail.
 - `Read/Write/Append/Sync`: synchronous I/O.
+- `SyncDirectory`: make creates, renames, and unlinks durable.
 - `SubmitBatch`: batched I/O (default: synchronous fallback; io_uring overrides
   with true batched submission).
 - Capability queries: `SupportsDirectIO/BatchedIO/RegisteredBuffers/FixedFiles`.
@@ -87,9 +89,9 @@ differ ONLY in the I/O submission/completion path.
 
 Held constant: memtable (concurrent skip list), SSTable format (block-based,
 sparse index, bloom filter), WAL format (append-only, per-record CRC),
-compaction policy (size-tiered), durability policy (WAL fsync on commit in
-server mode, disabled for the benchmark), and the YCSB-style A to F key/value
-distribution.
+compaction policy (level-0 full merge), durability policy (WAL fsync on
+commit in server mode; skipped by default in the benchmark), and the
+YCSB-inspired A to F key/value distribution.
 
 ## LSM Engine
 
@@ -104,9 +106,9 @@ distribution.
 - `Clear()` implements `FLUSHDB`: resets the memtable, deletes every SSTable
   file, and truncates the WAL (scoped to the engine's own data dir). `DbSize()`
   counts live keys across memtable + SSTables (newest version wins).
-- Compaction (`MaybeCompact`) is invoked from the flush path once the level-0
-  SSTable count reaches the size-tiered threshold; SSTable file sizes are read
-  from disk so the size-tiered grouping works.
+- Compaction is invoked from the flush path once the level-0 SSTable count
+  reaches four. It merges every table into one, releases `sst_mu_` while the
+  merge runs, and writes the output under a temporary name before renaming it.
 
 ## RESP2 Server
 
@@ -117,9 +119,11 @@ distribution.
   `std::bad_alloc`. Malformed input yields a `-ERR protocol error` reply and the
   connection is dropped; the server keeps running. The connection loop is also
   wrapped in `try/catch` as defense in depth.
-- Command set: `PING ECHO GET SET[NX/XX/EX] DEL EXISTS MGET MSET DBSIZE FLUSHDB
-  INFO SELECT COMMAND SCAN`. `SET EX` TTL is parsed but not enforced; `SCAN` is
-  a minimal stub; `SELECT` is a single-DB no-op.
+- Command set: `PING ECHO GET SET[NX/XX] DEL EXISTS MGET MSET DBSIZE FLUSHDB
+  INFO SELECT COMMAND SCAN AUTH`. `SET ... EX` is rejected; `SCAN` is a cursor
+  over a live-key snapshot; `SELECT` accepts only database 0.
+- Connection controls: optional shared-password auth, a connection limit, an
+  idle timeout, and a request buffer cap.
 
 ## Raft-lite Design
 
@@ -127,10 +131,10 @@ Implemented:
 - **Leader election** with randomized timeouts and **log replication** with
   next/match-index tracking and majority commit.
 - **Persistent state** (`<data_dir>/raft_state.bin`, CRC-checked, atomic
-  tmp+rename): `currentTerm`, `votedFor`, `commitIndex`, the log, and the latest
-  snapshot. Persistence is a no-op when `data_dir` is empty (ephemeral test
-  clusters). On restart, the committed log is replayed through the apply
-  callback to rebuild the state machine.
+  tmp+rename, bounds-checked on load): `currentTerm`, `votedFor`, `commitIndex`,
+  the log, and the latest snapshot. Persistence is a no-op when `data_dir` is
+  empty (ephemeral test clusters). On restart, the committed log is replayed
+  through the apply callback to rebuild the state machine.
 - **Snapshots**: `TakeSnapshot` compacts applied entries into a snapshot and
   truncates the log; `InstallSnapshot` RPC lets a leader fast-forward a follower
   that is behind the compacted log (the leader ships the snapshot when a
@@ -151,7 +155,7 @@ as a limitation rather than a full linearizable-read implementation.
 
 ## Dependencies
 
-- **Runtime:** system liburing 2.15.
+- **Runtime:** system liburing 2.14 or newer.
 - **Test:** doctest (header-only, via CMake FetchContent).
 - **Tooling (not runtime deps):** python3 + matplotlib (charts), perf +
   FlameGraph (profiling).
@@ -173,12 +177,15 @@ as a limitation rather than a full linearizable-read implementation.
 
 ## Limitations / future work
 
-- io_uring is ~0.76x of sync at the tiny cached benchmark scale (faster only on
-  read-only workload C). Winning would require batched submission and routing
-  the read/flush path through registered pool buffers at higher queue depth.
+- The benchmark scan path rebuilds the live-key set on every scan. It is not a
+  production iterator and does not scale with the dataset.
+- Compaction is a full level-0 merge. There is no leveled compaction.
 - No io_uring network reactor; networking uses plain POSIX sockets.
 - Raft TCP transport is real but tested in-process; a separate multi-process
-  cluster binary/harness is future work.
+  cluster binary or harness is future work.
 - Raft reads are leader-lease-style, not full ReadIndex; no follower reads.
-- No dynamic Raft membership. `SET EX` TTL not enforced; `SCAN` is a stub.
-- No production hardening (TLS/auth/ACL, rate limiting, multi-tenancy).
+- No dynamic Raft membership.
+- `SET ... EX` is rejected; TTL is not implemented.
+- `MSET` is serialized under one write lock, but a crash can leave a prefix.
+- TLS is not implemented. `AUTH` is a shared password over plain TCP.
+- No ACL, rate limiting, or multi-tenancy.

@@ -79,6 +79,14 @@ public:
     // Get file size.
     virtual Status FileSize(FileHandle fh, uint64_t* size) = 0;
 
+    // Truncate a file to `size` bytes. Used to cut a torn WAL tail after
+    // recovery so later appends are readable on the next restart.
+    virtual Status Truncate(FileHandle fh, uint64_t size) = 0;
+
+    // fsync a directory so creates, renames, and unlinks inside it are durable
+    // across a power loss.
+    virtual Status SyncDirectory(std::string_view path) = 0;
+
     // --- Synchronous I/O ---
 
     // Read exactly `len` bytes at `offset` into `buf`.

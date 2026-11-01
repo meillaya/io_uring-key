@@ -6,6 +6,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "engine/engine.h"
@@ -27,11 +28,33 @@ int main(int argc, char* argv[]) {
     std::string host = "127.0.0.1";
     uint16_t port = 6379;
     std::string backend_name = "sync";
+    std::string requirepass;
+    if (const char* env_pass = std::getenv("KV_REQUIREPASS")) requirepass = env_pass;
+    size_t max_connections = 1024;
+    int idle_timeout_ms = 300000;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--data-dir" && i + 1 < argc) data_dir = argv[++i];
         else if (arg == "--host" && i + 1 < argc) host = argv[++i];
+        else if (arg == "--requirepass" && i + 1 < argc) requirepass = argv[++i];
+        else if (arg == "--max-connections" && i + 1 < argc) {
+            try {
+                max_connections = static_cast<size_t>(std::stoul(argv[++i]));
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --max-connections\n");
+                return 1;
+            }
+        }
+        else if (arg == "--idle-timeout-ms" && i + 1 < argc) {
+            try {
+                idle_timeout_ms = std::stoi(argv[++i]);
+                if (idle_timeout_ms < 0) throw std::out_of_range("negative");
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --idle-timeout-ms\n");
+                return 1;
+            }
+        }
         else if (arg == "--port" && i + 1 < argc) {
             const std::string port_str = argv[++i];
             try {
@@ -49,6 +72,10 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (arg == "--backend" && i + 1 < argc) backend_name = argv[++i];
+        else {
+            std::fprintf(stderr, "Unknown or incomplete option: %s\n", arg.c_str());
+            return 1;
+        }
     }
 
     std::signal(SIGINT, SignalHandler);
@@ -69,8 +96,8 @@ int main(int argc, char* argv[]) {
     }
 #endif
     else {
-        std::fprintf(stderr, "Unknown backend: %s (using sync)\n", backend_name.c_str());
-        backend = std::make_unique<SyncBackend>();
+        std::fprintf(stderr, "Unknown backend: %s\n", backend_name.c_str());
+        return 1;
     }
 
     EngineOptions opts;
@@ -87,6 +114,9 @@ int main(int argc, char* argv[]) {
     ServerOptions server_opts;
     server_opts.host = host;
     server_opts.port = port;
+    server_opts.max_connections = max_connections;
+    server_opts.idle_timeout_ms = idle_timeout_ms;
+    server_opts.requirepass = requirepass;
 
     Server server(engine, server_opts);
     s = server.Start();
@@ -95,8 +125,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::printf("kernel-v2 KV server running on %s:%d (backend: %s, data: %s)\n",
-                host.c_str(), port, backend_name.c_str(), data_dir.c_str());
+    std::printf("kernel-v2 KV server running on %s:%d (backend: %s, data: %s, auth: %s)\n",
+                host.c_str(), port, backend_name.c_str(), data_dir.c_str(),
+                requirepass.empty() ? "off" : "on");
     std::printf("Press Ctrl+C to stop.\n");
 
     while (!g_shutdown) {

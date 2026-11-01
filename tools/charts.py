@@ -4,7 +4,7 @@
 Reads the CSV produced by `kv_bench` (default: benchmark_results.csv) whose
 columns are:
 
-    backend, workload, total_ops, reads, writes, elapsed_sec, throughput_ops,
+    backend, workload, sync_wal, total_ops, reads, writes, elapsed_sec, throughput_ops,
     overall_p50_us, overall_p95_us, overall_p99_us,
     read_p50_us, read_p95_us, read_p99_us,
     write_p50_us, write_p95_us, write_p99_us

@@ -297,7 +297,14 @@ private:
     static LineResult ReadLine(std::string_view buf, size_t& pos, std::string& err) {
         LineResult r;
         auto crlf = buf.find("\r\n", pos);
-        if (crlf == std::string_view::npos) return r;  // kIncomplete
+        if (crlf == std::string_view::npos) {
+            // Do not wait forever for a terminator that may never arrive.
+            if (buf.size() - pos > static_cast<size_t>(kMaxInlineLine) + 1) {
+                r.status = ParseStatus::kError;
+                err = "line too long";
+            }
+            return r;  // kIncomplete unless the line crossed the cap
+        }
         if (static_cast<int64_t>(crlf - pos) > kMaxInlineLine + 1) {
             r.status = ParseStatus::kError;
             err = "line too long";
