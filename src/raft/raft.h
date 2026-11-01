@@ -485,10 +485,12 @@ public:
             } else {
                 auto it = FindLogEntry(args.prev_log_index);
                 if (!it || it->term != args.prev_log_term) {
+                    std::vector<LogEntry> old_log = log_;
                     TruncateLogFrom(args.prev_log_index);
                     log_changed = true;
                     auto persisted = PersistState();
                     if (!persisted.ok()) {
+                        log_ = std::move(old_log);
                         KV_LOG_ERROR("Node %s cannot persist log truncation: %s",
                                      config_.node_id.c_str(),
                                      persisted.ToString().c_str());

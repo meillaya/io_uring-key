@@ -383,7 +383,10 @@ private:
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(pa.port);
-        ::inet_pton(AF_INET, pa.host.c_str(), &addr.sin_addr);
+        if (::inet_pton(AF_INET, pa.host.c_str(), &addr.sin_addr) != 1) {
+            ::close(fd);
+            return Status::InvalidArgument("invalid peer host: " + pa.host);
+        }
         if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
             ::close(fd);
             return Status::IOError("connect " + target + ": " + std::strerror(errno));
