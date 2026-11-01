@@ -30,6 +30,10 @@ int main(int argc, char* argv[]) {
     std::string backend_name = "sync";
     std::string requirepass;
     if (const char* env_pass = std::getenv("KV_REQUIREPASS")) requirepass = env_pass;
+    std::string tls_cert;
+    std::string tls_key;
+    if (const char* env_cert = std::getenv("KV_TLS_CERT")) tls_cert = env_cert;
+    if (const char* env_key = std::getenv("KV_TLS_KEY")) tls_key = env_key;
     size_t max_connections = 1024;
     int idle_timeout_ms = 300000;
 
@@ -38,6 +42,8 @@ int main(int argc, char* argv[]) {
         if (arg == "--data-dir" && i + 1 < argc) data_dir = argv[++i];
         else if (arg == "--host" && i + 1 < argc) host = argv[++i];
         else if (arg == "--requirepass" && i + 1 < argc) requirepass = argv[++i];
+        else if (arg == "--tls-cert" && i + 1 < argc) tls_cert = argv[++i];
+        else if (arg == "--tls-key" && i + 1 < argc) tls_key = argv[++i];
         else if (arg == "--max-connections" && i + 1 < argc) {
             try {
                 max_connections = static_cast<size_t>(std::stoul(argv[++i]));
@@ -117,6 +123,8 @@ int main(int argc, char* argv[]) {
     server_opts.max_connections = max_connections;
     server_opts.idle_timeout_ms = idle_timeout_ms;
     server_opts.requirepass = requirepass;
+    server_opts.tls_cert = tls_cert;
+    server_opts.tls_key = tls_key;
 
     Server server(engine, server_opts);
     s = server.Start();
@@ -125,9 +133,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::printf("kernel-v2 KV server running on %s:%d (backend: %s, data: %s, auth: %s)\n",
+    std::printf("kernel-v2 KV server running on %s:%d (backend: %s, data: %s, auth: %s, tls: %s)\n",
                 host.c_str(), port, backend_name.c_str(), data_dir.c_str(),
-                requirepass.empty() ? "off" : "on");
+                requirepass.empty() ? "off" : "on",
+                tls_cert.empty() ? "off" : "on");
     std::printf("Press Ctrl+C to stop.\n");
 
     while (!g_shutdown) {

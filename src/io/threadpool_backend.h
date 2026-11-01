@@ -43,6 +43,14 @@ public:
 
     Status Close(FileHandle fh) override { return sync_->Close(fh); }
     Status Delete(std::string_view path) override { return sync_->Delete(path); }
+    Status Rename(std::string_view from, std::string_view to) override {
+        std::string from_str(from);
+        std::string to_str(to);
+        return Dispatch([this, from_str = std::move(from_str),
+                         to_str = std::move(to_str)] {
+            return sync_->Rename(from_str, to_str);
+        });
+    }
     Status FileSize(FileHandle fh, uint64_t* size) override {
         return sync_->FileSize(fh, size);
     }

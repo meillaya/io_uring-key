@@ -6,6 +6,7 @@
     ninja
     pkg-config
     liburing
+    openssl
     python3
     python3Packages.matplotlib
     perf

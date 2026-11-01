@@ -395,12 +395,8 @@ private:
         auto s = writer.Build(sst_entries);
         if (!s.ok()) return s;
 
-        std::error_code rename_ec;
-        std::filesystem::rename(tmp_path, sst_path, rename_ec);
-        if (rename_ec) {
-            return Status::IOError("rename SSTable " + tmp_path + ": " +
-                                   rename_ec.message());
-        }
+        auto rename_status = backend_->Rename(tmp_path, sst_path);
+        if (!rename_status.ok()) return rename_status;
 
         // Make the new directory entry durable before the WAL is truncated.
         s = backend_->SyncDirectory(opts_.data_dir);
@@ -473,12 +469,8 @@ private:
                                               opts_.sstable_block_size);
         if (!s.ok()) return s;
 
-        std::error_code rename_ec;
-        std::filesystem::rename(tmp_path, output_path, rename_ec);
-        if (rename_ec) {
-            return Status::IOError("rename SSTable " + tmp_path + ": " +
-                                   rename_ec.message());
-        }
+        auto rename_status = backend_->Rename(tmp_path, output_path);
+        if (!rename_status.ok()) return rename_status;
 
         // Make the merged table durable before deleting its inputs.
         s = backend_->SyncDirectory(opts_.data_dir);

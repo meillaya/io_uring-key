@@ -76,6 +76,9 @@ public:
     // Delete a file by path.
     virtual Status Delete(std::string_view path) = 0;
 
+    // Rename a file. Used to publish an SSTable atomically.
+    virtual Status Rename(std::string_view from, std::string_view to) = 0;
+
     // Get file size.
     virtual Status FileSize(FileHandle fh, uint64_t* size) = 0;
 

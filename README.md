@@ -20,9 +20,10 @@ This is a research prototype for systems programmers. It has known gaps. Read
 
 ## Requirements
 
-The dev shell supplies liburing 2.14, GCC 16, Clang 22, CMake 4.1, Python 3, and
-matplotlib. Without Nix you need Linux with io_uring, liburing 2.14 or newer,
-CMake 3.28 or newer, and a C++23 compiler. The CI build uses GCC 13.
+The dev shell supplies liburing 2.14, GCC 16, Clang 22, CMake 4.1, Python 3,
+matplotlib, and OpenSSL. Without Nix you need Linux with io_uring, liburing 2.14
+or newer, CMake 3.28 or newer, and a C++23 compiler. The CI build uses GCC 13.
+OpenSSL is needed only for `-DKV_ENABLE_TLS=ON`.
 
 ## Quick start
 
@@ -35,6 +36,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+For TLS, configure with `-DKV_ENABLE_TLS=ON` and pass `--tls-cert` and
+`--tls-key` when starting the server.
 
 Start the server in one terminal:
 
@@ -79,6 +83,8 @@ figure source and render command are in
   time on its hot path.
 - RESP2 server: `PING`, `ECHO`, `GET`, `SET`, `DEL`, `EXISTS`, `MGET`, `MSET`,
   `DBSIZE`, `FLUSHDB`, `INFO`, `SELECT`, `COMMAND`, `SCAN`, and `AUTH`.
+- Transport: optional TLS with OpenSSL, enabled at build time with
+  `-DKV_ENABLE_TLS=ON` and at runtime with `--tls-cert` and `--tls-key`.
 - Server controls: optional shared-password auth, a connection limit, and an
   idle timeout. Set `--requirepass secret` or `KV_REQUIREPASS` to enable auth.
 - Raft library: elections, log replication, a persistent log, snapshots, and a
@@ -89,12 +95,12 @@ figure source and render command are in
 ## Limits
 
 - `SET ... EX` is rejected with an error. TTL is not implemented.
-- `MSET` is serialized under one write lock, but a crash can leave a prefix of
-  the batch. It is not crash-atomic.
+- `MSET` is one batch WAL record. A torn batch is discarded as a unit, so it
+  does not leave a prefix. A crash after a full batch is recovered as a batch.
 - The Raft library is not part of the server. The leader serves reads without a
   ReadIndex confirmation.
-- TLS is not implemented. `AUTH` is a shared password over plain TCP, so do not
-  expose the server to an untrusted network.
+- TLS is optional. Without `--tls-cert` and `--tls-key`, `AUTH` is a shared
+  password over plain TCP, so do not expose that mode to an untrusted network.
 - `SCAN` and benchmark workload E collect every live key for each call. They are
   correct at small scale and do not scale with the dataset.
 - The benchmark uses uniform keys, not the Zipfian distribution of the default
@@ -135,18 +141,19 @@ table as a smoke benchmark, not a production comparison.
 
 ## Tests
 
-`ctest --test-dir build` runs 82 doctest cases with the io_uring backend enabled,
-and 74 without it. The suite covers WAL tail repair, randomized engine
-operations against `std::map`, SIGKILL recovery, directory fsync ordering,
-RESP parsing, malformed socket input, compaction, concurrent readers, Raft
-persistence and snapshots, and a three-node TCP cluster.
+`ctest --test-dir build` runs 77 doctest cases in the default build, 78 with
+TLS, and 85 with the io_uring backend. The suite covers WAL tail repair, batch
+WAL recovery, randomized engine operations against `std::map`, SIGKILL
+recovery, simulated power loss, directory fsync ordering, RESP parsing,
+malformed socket input, compaction, concurrent readers, Raft persistence and
+snapshots, a three-node TCP cluster, and a TLS handshake.
 
-CI runs the 74-case build, AddressSanitizer with UndefinedBehaviorSanitizer, and
-ThreadSanitizer with io_uring disabled. Run the 82-case io_uring suite on a
-Linux host.
+CI runs the default 77-case build, AddressSanitizer with UndefinedBehaviorSanitizer,
+ThreadSanitizer, and a TLS build. Run the 85-case io_uring suite on a Linux host.
 
-The crash tests use SIGKILL, which does not test power loss. The Raft tests use
-sleeps and are timing-sensitive.
+The crash tests use SIGKILL, and the power-loss test uses a fault-injecting
+backend that drops unsynced directory entries. Neither is a real hardware power
+cut. The Raft tests use sleeps and are timing-sensitive.
 
 ## Docs
 

@@ -12,6 +12,7 @@ option(KV_BUILD_BENCH "Build benchmarks" ON)
 option(KV_USE_IOURING "Enable io_uring backend" ON)
 option(KV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(KV_TSAN "Build with ThreadSanitizer" OFF)
+option(KV_ENABLE_TLS "Enable TLS with OpenSSL" OFF)
 
 if(KV_SANITIZE AND KV_TSAN)
   message(FATAL_ERROR "KV_SANITIZE and KV_TSAN are mutually exclusive")
@@ -32,6 +33,10 @@ if(KV_USE_IOURING)
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.14)
 endif()
 
+if(KV_ENABLE_TLS)
+  find_package(OpenSSL REQUIRED)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(
   doctest
@@ -48,6 +53,11 @@ target_compile_features(kv_core INTERFACE cxx_std_23)
 if(KV_USE_IOURING)
   target_link_libraries(kv_core INTERFACE PkgConfig::LIBURING)
   target_compile_definitions(kv_core INTERFACE KV_HAS_IOURING=1)
+endif()
+
+if(KV_ENABLE_TLS)
+  target_link_libraries(kv_core INTERFACE OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(kv_core INTERFACE KV_HAS_TLS=1)
 endif()
 
 add_executable(kv_server src/main.cpp)

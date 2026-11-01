@@ -9,6 +9,7 @@
 A log-structured key-value store in C++23 with:
 - WAL + skip-list memtable + SSTables + level-0 full compaction (LSM-tree).
 - Four interchangeable I/O backends (sync, threadpool, mmap, io_uring).
+- Optional TLS with OpenSSL.
 - RESP2 API over TCP with a bounded command set and a hardened parser.
 - Raft library (standalone, not used by the server): election, log
   replication, **persistent log + snapshots**, and a **real TCP transport**
@@ -66,6 +67,7 @@ same interface; the engine/WAL/SSTable layers only touch I/O through it.
 Interface methods:
 - `Open/Close/Delete/FileSize`: file lifecycle.
 - `Truncate`: cut a torn WAL tail.
+- `Rename`: publish an SSTable atomically.
 - `Read/Write/Append/Sync`: synchronous I/O.
 - `SyncDirectory`: make creates, renames, and unlinks durable.
 - `SubmitBatch`: batched I/O (default: synchronous fallback; io_uring overrides
@@ -122,6 +124,10 @@ YCSB-inspired A to F key/value distribution.
 - Command set: `PING ECHO GET SET[NX/XX] DEL EXISTS MGET MSET DBSIZE FLUSHDB
   INFO SELECT COMMAND SCAN AUTH`. `SET ... EX` is rejected; `SCAN` is a cursor
   over a live-key snapshot; `SELECT` accepts only database 0.
+- `MSET` writes one CRC-protected batch record. A torn batch is discarded as a
+  unit, so recovery never applies a prefix.
+- Transport: optional TLS 1.2 or newer with a PEM certificate chain and key.
+  Plain TCP remains the default.
 - Connection controls: optional shared-password auth, a connection limit, an
   idle timeout, and a request buffer cap.
 
@@ -155,7 +161,7 @@ as a limitation rather than a full linearizable-read implementation.
 
 ## Dependencies
 
-- **Runtime:** system liburing 2.14 or newer.
+- **Runtime:** system liburing 2.14 or newer. OpenSSL is optional for TLS.
 - **Test:** doctest (header-only, via CMake FetchContent).
 - **Tooling (not runtime deps):** python3 + matplotlib (charts), perf +
   FlameGraph (profiling).
@@ -186,6 +192,6 @@ as a limitation rather than a full linearizable-read implementation.
 - Raft reads are leader-lease-style, not full ReadIndex; no follower reads.
 - No dynamic Raft membership.
 - `SET ... EX` is rejected; TTL is not implemented.
-- `MSET` is serialized under one write lock, but a crash can leave a prefix.
-- TLS is not implemented. `AUTH` is a shared password over plain TCP.
+- TLS is optional and must be enabled at build time and runtime.
+- `AUTH` is a shared password. Use TLS when the network is untrusted.
 - No ACL, rate limiting, or multi-tenancy.

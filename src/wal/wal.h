@@ -25,37 +25,78 @@ namespace kv {
 //   [val_len bytes: value]
 //   [4 bytes: CRC32C of everything above]
 //
-// Total on-disk size per record: 4 + 1 + 4 + key_len + 4 + val_len + 4
+// A batch record carries a list of put/delete operations:
+//   [1 byte: kBatch]
+//   [4 bytes: op_count]
+//   [op_count x (1 byte: op, 4 bytes: key_len, key, 4 bytes: val_len, value)]
+//
+// The CRC covers the whole batch, so a torn batch is discarded as a unit.
 
 enum class WALRecordType : uint8_t {
     kPut = 1,
     kDelete = 2,
+    kBatch = 3,
 };
 
 struct WALRecord {
-    WALRecordType type;
+    WALRecordType type = WALRecordType::kPut;
     std::string key;
     std::string value;  // Empty for deletes.
+    std::vector<WALRecord> batch;  // Populated for kBatch.
 };
+
+inline size_t WALBatchPayloadSize(const std::vector<WALRecord>& records) {
+    size_t payload = 4;  // op count
+    for (auto& rec : records) {
+        payload += 1 + 4 + rec.key.size() + 4 + rec.value.size();
+    }
+    return payload;
+}
 
 // Compute the on-disk size of a WAL record.
 inline size_t WALRecordSize(const WALRecord& rec) {
+    if (rec.type == WALRecordType::kBatch) {
+        return 4 + 1 + WALBatchPayloadSize(rec.batch) + 4;
+    }
     return 4 + 1 + 4 + rec.key.size() + 4 + rec.value.size() + 4;
 }
 
 // Serialize a WAL record into a buffer. Returns bytes written.
 inline size_t SerializeWALRecord(const WALRecord& rec, uint8_t* buf) {
     uint8_t* p = buf;
-    uint32_t record_len = 1 + 4 + static_cast<uint32_t>(rec.key.size()) +
-                          4 + static_cast<uint32_t>(rec.value.size());
-    std::memcpy(p, &record_len, 4); p += 4;
-    *p = static_cast<uint8_t>(rec.type); p += 1;
-    uint32_t klen = static_cast<uint32_t>(rec.key.size());
-    std::memcpy(p, &klen, 4); p += 4;
-    std::memcpy(p, rec.key.data(), klen); p += klen;
-    uint32_t vlen = static_cast<uint32_t>(rec.value.size());
-    std::memcpy(p, &vlen, 4); p += 4;
-    if (vlen > 0) { std::memcpy(p, rec.value.data(), vlen); p += vlen; }
+    if (rec.type == WALRecordType::kBatch) {
+        uint32_t record_len = static_cast<uint32_t>(
+            1 + WALBatchPayloadSize(rec.batch));
+        std::memcpy(p, &record_len, 4); p += 4;
+        *p = static_cast<uint8_t>(WALRecordType::kBatch); p += 1;
+        uint32_t count = static_cast<uint32_t>(rec.batch.size());
+        std::memcpy(p, &count, 4); p += 4;
+
+        for (auto& op : rec.batch) {
+            *p = static_cast<uint8_t>(op.type); p += 1;
+            uint32_t klen = static_cast<uint32_t>(op.key.size());
+            std::memcpy(p, &klen, 4); p += 4;
+            std::memcpy(p, op.key.data(), klen); p += klen;
+            uint32_t vlen = static_cast<uint32_t>(op.value.size());
+            std::memcpy(p, &vlen, 4); p += 4;
+            if (vlen > 0) {
+                std::memcpy(p, op.value.data(), vlen);
+                p += vlen;
+            }
+        }
+    } else {
+        uint32_t record_len = 1 + 4 + static_cast<uint32_t>(rec.key.size()) +
+                              4 + static_cast<uint32_t>(rec.value.size());
+        std::memcpy(p, &record_len, 4); p += 4;
+        *p = static_cast<uint8_t>(rec.type); p += 1;
+        uint32_t klen = static_cast<uint32_t>(rec.key.size());
+        std::memcpy(p, &klen, 4); p += 4;
+        std::memcpy(p, rec.key.data(), klen); p += klen;
+        uint32_t vlen = static_cast<uint32_t>(rec.value.size());
+        std::memcpy(p, &vlen, 4); p += 4;
+        if (vlen > 0) { std::memcpy(p, rec.value.data(), vlen); p += vlen; }
+    }
+
     // CRC over everything before the CRC field.
     uint32_t crc = CRC32::Compute(buf, static_cast<size_t>(p - buf));
     std::memcpy(p, &crc, 4); p += 4;
@@ -81,7 +122,9 @@ public:
         if (!s.ok()) return s;
         s = backend_->FileSize(fh_, &write_offset_);
         if (!s.ok()) return s;
-        return Status::OK();
+        // Make a newly created WAL's directory entry durable before any write
+        // can be acknowledged.
+        return backend_->SyncDirectory(dir_);
     }
 
     // Append a record to the WAL. Does NOT fsync (use Sync() for durability).
@@ -98,24 +141,20 @@ public:
         return Status::OK();
     }
 
-    // Append a batch of records (group commit).
+    // Append a batch of records as one CRC-protected WAL record. A torn write
+    // leaves no prefix of the batch in the log.
     Status AppendBatch(const std::vector<WALRecord>& records) {
-        // Serialize all records into one buffer for a single write.
-        size_t total = 0;
-        for (auto& r : records) total += WALRecordSize(r);
-
-        std::vector<uint8_t> buf(total);
-        size_t off = 0;
-        for (auto& r : records) {
-            off += SerializeWALRecord(r, buf.data() + off);
+        if (records.empty()) return Status::OK();
+        for (auto& rec : records) {
+            if (rec.type != WALRecordType::kPut &&
+                rec.type != WALRecordType::kDelete) {
+                return Status::InvalidArgument("batch contains a non-operation record");
+            }
         }
-
-        uint64_t offset;
-        auto s = backend_->Append(fh_, buf.data(), buf.size(), &offset);
-        if (!s.ok()) return s;
-        write_offset_ = offset + buf.size();
-        pending_sync_ = true;
-        return Status::OK();
+        WALRecord batch;
+        batch.type = WALRecordType::kBatch;
+        batch.batch = records;
+        return Append(batch);
     }
 
     // Fsync the WAL to durable storage.
@@ -183,17 +222,100 @@ public:
             // Parse the record.
             WALRecord rec;
             const uint8_t* payload = data.data() + pos + 4;
-            rec.type = static_cast<WALRecordType>(payload[0]);
+            uint8_t type = payload[0];
 
-            uint32_t klen;
+            if (type == static_cast<uint8_t>(WALRecordType::kBatch)) {
+                if (record_len < 5) {
+                    KV_LOG_WARN("WAL replay: batch header too short at offset %zu", pos);
+                    break;
+                }
+
+                rec.type = WALRecordType::kBatch;
+                uint32_t op_count = 0;
+                std::memcpy(&op_count, payload + 1, 4);
+                if (op_count > (record_len - 5) / 9) {
+                    KV_LOG_WARN("WAL replay: batch count exceeds payload at offset %zu", pos);
+                    break;
+                }
+
+                size_t off = 5;
+                bool corrupt = false;
+                rec.batch.reserve(op_count);
+                for (uint32_t i = 0; i < op_count; i++) {
+                    if (off + 5 > record_len) { corrupt = true; break; }
+                    WALRecord op;
+                    uint8_t op_type = payload[off++];
+                    if (op_type != static_cast<uint8_t>(WALRecordType::kPut) &&
+                        op_type != static_cast<uint8_t>(WALRecordType::kDelete)) {
+                        corrupt = true;
+                        break;
+                    }
+                    op.type = static_cast<WALRecordType>(op_type);
+
+                    uint32_t klen = 0;
+                    std::memcpy(&klen, payload + off, 4);
+                    off += 4;
+                    if (record_len - off < 4 || klen > record_len - off - 4) {
+                        corrupt = true;
+                        break;
+                    }
+                    op.key.assign(reinterpret_cast<const char*>(payload + off), klen);
+                    off += klen;
+
+                    if (record_len - off < 4) { corrupt = true; break; }
+                    uint32_t vlen = 0;
+                    std::memcpy(&vlen, payload + off, 4);
+                    off += 4;
+                    if (vlen > record_len - off) { corrupt = true; break; }
+                    if (vlen > 0) {
+                        op.value.assign(reinterpret_cast<const char*>(payload + off), vlen);
+                    }
+                    off += vlen;
+                    rec.batch.push_back(std::move(op));
+                }
+
+                if (corrupt || off != record_len) {
+                    KV_LOG_WARN("WAL replay: corrupt batch at offset %zu, stopping", pos);
+                    break;
+                }
+
+                pos += total_record_size;
+                valid_end = pos;
+
+                bool stopped = false;
+                for (auto& op : rec.batch) {
+                    if (!cb(op)) {
+                        stopped = true;
+                        break;
+                    }
+                    count++;
+                }
+                if (stopped) break;
+                continue;
+            }
+
+            if (type != static_cast<uint8_t>(WALRecordType::kPut) &&
+                type != static_cast<uint8_t>(WALRecordType::kDelete)) {
+                KV_LOG_WARN("WAL replay: unknown record type %u at offset %zu, stopping",
+                            type, pos);
+                break;
+            }
+
+            if (record_len < 9) {
+                KV_LOG_WARN("WAL replay: record too short at offset %zu", pos);
+                break;
+            }
+
+            rec.type = static_cast<WALRecordType>(type);
+            uint32_t klen = 0;
             std::memcpy(&klen, payload + 1, 4);
-            if (1 + 4 + klen + 4 > record_len) {
+            if (klen > record_len - 1 - 4 - 4) {
                 KV_LOG_WARN("WAL replay: corrupt key_len at offset %zu, stopping", pos);
                 break;
             }
             rec.key.assign(reinterpret_cast<const char*>(payload + 5), klen);
 
-            uint32_t vlen;
+            uint32_t vlen = 0;
             std::memcpy(&vlen, payload + 5 + klen, 4);
             if (1 + 4 + klen + 4 + vlen != record_len) {
                 KV_LOG_WARN("WAL replay: corrupt val_len at offset %zu, stopping", pos);
@@ -203,10 +325,10 @@ public:
                 rec.value.assign(reinterpret_cast<const char*>(payload + 9 + klen), vlen);
             }
 
-            if (!cb(rec)) break;
-            count++;
             pos += total_record_size;
             valid_end = pos;
+            if (!cb(rec)) break;
+            count++;
         }
 
         // A torn or corrupt tail stays in the file. Cut it before the engine

@@ -1,5 +1,5 @@
 #pragma once
-// Redis-compatible RESP2 server over TCP.
+// Redis-compatible RESP2 server over TCP, with optional TLS.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -22,6 +22,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef KV_HAS_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
+
 #include "engine/engine.h"
 #include "server/command_handler.h"
 #include "server/resp.h"
@@ -36,6 +41,8 @@ struct ServerOptions {
     size_t max_connections = 1024;
     int idle_timeout_ms = 300000;  // 5 minutes; 0 disables the timeout.
     std::string requirepass;       // Empty means auth is disabled.
+    std::string tls_cert;          // PEM chain; empty disables TLS.
+    std::string tls_key;           // PEM private key.
 };
 
 class Server {
@@ -44,9 +51,20 @@ public:
         : engine_(engine), handler_(engine), opts_(std::move(opts)),
           listen_fd_(-1), running_(false) {}
 
-    ~Server() { Stop(); }
+    ~Server() {
+        Stop();
+#ifdef KV_HAS_TLS
+        if (tls_ctx_ != nullptr) {
+            SSL_CTX_free(tls_ctx_);
+            tls_ctx_ = nullptr;
+        }
+#endif
+    }
 
     Status Start() {
+        auto tls_status = InitTls();
+        if (!tls_status.ok()) return tls_status;
+
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             return Status::IOError(std::string("socket: ") + std::strerror(errno));
@@ -87,7 +105,8 @@ public:
         }
 
         running_ = true;
-        KV_LOG_INFO("Server listening on %s:%d", opts_.host.c_str(), opts_.port);
+        KV_LOG_INFO("Server listening on %s:%d (tls: %s)", opts_.host.c_str(),
+                    opts_.port, tls_enabled() ? "on" : "off");
 
         accept_thread_ = std::thread([this] { AcceptLoop(); });
         return Status::OK();
@@ -104,8 +123,8 @@ public:
         }
         if (accept_thread_.joinable()) accept_thread_.join();
 
-        // Unblock handlers that are parked in recv. The accept loop is gone, so
-        // no new descriptors can enter the set.
+        // Unblock handlers that are parked in recv or SSL_read. The accept loop
+        // is gone, so no new descriptors can enter the set.
         {
             std::lock_guard lock(clients_mu_);
             for (int client_fd : client_fds_) {
@@ -124,8 +143,65 @@ public:
     [[nodiscard]] uint16_t port() const { return opts_.port; }
     [[nodiscard]] uint16_t bound_port() const { return opts_.port; }
     [[nodiscard]] bool running() const { return running_; }
+    [[nodiscard]] bool tls_enabled() const {
+#ifdef KV_HAS_TLS
+        return tls_ctx_ != nullptr;
+#else
+        return false;
+#endif
+    }
 
 private:
+    struct ClientSocket {
+        int fd = -1;
+#ifdef KV_HAS_TLS
+        SSL* ssl = nullptr;
+#endif
+    };
+
+    Status InitTls() {
+#ifdef KV_HAS_TLS
+        if (opts_.tls_cert.empty() && opts_.tls_key.empty()) {
+            return Status::OK();
+        }
+        if (opts_.tls_cert.empty() || opts_.tls_key.empty()) {
+            return Status::InvalidArgument("both tls_cert and tls_key are required");
+        }
+
+        OPENSSL_init_ssl(0, nullptr);
+        tls_ctx_ = SSL_CTX_new(TLS_server_method());
+        if (tls_ctx_ == nullptr) {
+            return Status::IOError("SSL_CTX_new: " + SslError());
+        }
+        SSL_CTX_set_min_proto_version(tls_ctx_, TLS1_2_VERSION);
+        if (SSL_CTX_use_certificate_chain_file(tls_ctx_, opts_.tls_cert.c_str()) != 1) {
+            return Status::IOError("load TLS certificate: " + SslError());
+        }
+        if (SSL_CTX_use_PrivateKey_file(tls_ctx_, opts_.tls_key.c_str(),
+                                        SSL_FILETYPE_PEM) != 1) {
+            return Status::IOError("load TLS private key: " + SslError());
+        }
+        if (SSL_CTX_check_private_key(tls_ctx_) != 1) {
+            return Status::IOError("TLS private key does not match certificate: " +
+                                   SslError());
+        }
+        return Status::OK();
+#else
+        if (!opts_.tls_cert.empty() || !opts_.tls_key.empty()) {
+            return Status::NotSupported("TLS support was not compiled in");
+        }
+        return Status::OK();
+#endif
+    }
+
+#ifdef KV_HAS_TLS
+    static std::string SslError() {
+        char buffer[256];
+        ERR_error_string_n(ERR_get_error(), buffer, sizeof(buffer));
+        return std::string(buffer);
+    }
+#endif
+
     void AcceptLoop() {
         while (running_) {
             struct sockaddr_in client_addr{};
@@ -140,8 +216,11 @@ private:
                 continue;
             }
 
+            ClientSocket socket;
+            socket.fd = client_fd;
+
             if (live_connections_.load() >= opts_.max_connections) {
-                SendValue(client_fd, RespValue::Error("ERR max clients reached"));
+                SendValue(socket, RespValue::Error("ERR max clients reached"));
                 ::close(client_fd);
                 continue;
             }
@@ -167,16 +246,37 @@ private:
                 live_connections_.fetch_add(1);
             }
 
+#ifdef KV_HAS_TLS
+            if (tls_ctx_ != nullptr) {
+                socket.ssl = SSL_new(tls_ctx_);
+                if (socket.ssl == nullptr) {
+                    KV_LOG_ERROR("SSL_new failed: %s", SslError().c_str());
+                    RemoveClient(client_fd);
+                    continue;
+                }
+                SSL_set_fd(socket.ssl, client_fd);
+                if (SSL_accept(socket.ssl) <= 0) {
+                    KV_LOG_WARN("TLS handshake failed: %s", SslError().c_str());
+                    SSL_free(socket.ssl);
+                    RemoveClient(client_fd);
+                    continue;
+                }
+            }
+#endif
+
             auto done = std::make_shared<std::atomic<bool>>(false);
             try {
                 client_threads_.push_back(ClientConn{
-                    std::thread([this, client_fd, done] {
-                        HandleClient(client_fd);
+                    std::thread([this, socket, done] {
+                        HandleClient(socket);
                         done->store(true, std::memory_order_release);
                     }),
                     done});
             } catch (const std::exception& e) {
                 KV_LOG_ERROR("client thread start failed: %s", e.what());
+#ifdef KV_HAS_TLS
+                if (socket.ssl != nullptr) SSL_free(socket.ssl);
+#endif
                 RemoveClient(client_fd);
             }
         }
@@ -222,9 +322,30 @@ private:
         ::close(fd);
     }
 
-    void CloseClient(int fd) { RemoveClient(fd); }
+    void CloseClient(ClientSocket& socket) {
+#ifdef KV_HAS_TLS
+        if (socket.ssl != nullptr) {
+            SSL_free(socket.ssl);
+            socket.ssl = nullptr;
+        }
+#endif
+        RemoveClient(socket.fd);
+    }
 
-    void HandleClient(int fd) {
+    ssize_t ReadSome(ClientSocket& socket, char* buffer, size_t length) {
+#ifdef KV_HAS_TLS
+        if (socket.ssl != nullptr) {
+            int n = SSL_read(socket.ssl, buffer, static_cast<int>(length));
+            if (n > 0) return n;
+            int error = SSL_get_error(socket.ssl, n);
+            if (error == SSL_ERROR_SYSCALL && errno == EINTR) return 0;
+            return n;
+        }
+#endif
+        return ::recv(socket.fd, buffer, length, 0);
+    }
+
+    void HandleClient(ClientSocket socket) {
         std::string buffer;
         char recv_buf[65536];
         bool authenticated = opts_.requirepass.empty();
@@ -234,13 +355,13 @@ private:
         // so a malformed/huge request can never SIGABRT the process.
         try {
             while (running_) {
-                ssize_t n = ::recv(fd, recv_buf, sizeof(recv_buf), 0);
+                ssize_t n = ReadSome(socket, recv_buf, sizeof(recv_buf));
                 if (n <= 0) break;
 
                 buffer.append(recv_buf, static_cast<size_t>(n));
                 if (buffer.size() > kMaxConnectionBuffer) {
-                    SendError(fd, "ERR request too large");
-                    CloseClient(fd);
+                    SendError(socket, "ERR request too large");
+                    CloseClient(socket);
                     return;
                 }
 
@@ -250,8 +371,8 @@ private:
                     try {
                         parsed = RespParser::ParseCommandSafe(buffer);
                     } catch (const std::exception& e) {
-                        SendError(fd, std::string("ERR internal error: ") + e.what());
-                        CloseClient(fd);
+                        SendError(socket, std::string("ERR internal error: ") + e.what());
+                        CloseClient(socket);
                         return;
                     }
 
@@ -261,8 +382,8 @@ private:
                         // Malformed protocol input: reply with an error and drop
                         // the connection (matches Redis behavior). The server
                         // itself keeps running.
-                        SendError(fd, "ERR protocol error: " + parsed.error);
-                        CloseClient(fd);
+                        SendError(socket, "ERR protocol error: " + parsed.error);
+                        CloseClient(socket);
                         return;
                     }
 
@@ -283,7 +404,7 @@ private:
                         response = RespValue::Error("ERR internal error");
                     }
 
-                    if (!SendValue(fd, response)) break;
+                    if (!SendValue(socket, response)) break;
                 }
             }
         } catch (const std::exception& e) {
@@ -292,15 +413,31 @@ private:
             KV_LOG_ERROR("connection error: unknown");
         }
 
-        CloseClient(fd);
+        CloseClient(socket);
     }
 
     // Serialize and fully send a RESP value. Returns false on socket failure.
-    bool SendValue(int fd, const RespValue& response) {
+    bool SendValue(ClientSocket& socket, const RespValue& response) {
         std::string serialized = RespSerializer::Serialize(response);
         size_t sent = 0;
         while (sent < serialized.size()) {
-            ssize_t w = ::send(fd, serialized.data() + sent,
+#ifdef KV_HAS_TLS
+            if (socket.ssl != nullptr) {
+                int w = SSL_write(socket.ssl, serialized.data() + sent,
+                                  static_cast<int>(serialized.size() - sent));
+                if (w <= 0) {
+                    int error = SSL_get_error(socket.ssl, w);
+                    if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
+                    return false;
+                }
+                sent += static_cast<size_t>(w);
+                continue;
+            }
+#endif
+            ssize_t w = ::send(socket.fd, serialized.data() + sent,
                                serialized.size() - sent, MSG_NOSIGNAL);
             if (w < 0 && errno == EINTR) continue;
             if (w <= 0) return false;
@@ -309,8 +446,8 @@ private:
         return true;
     }
 
-    void SendError(int fd, const std::string& msg) {
-        SendValue(fd, RespValue::Error(msg));
+    void SendError(ClientSocket& socket, const std::string& msg) {
+        SendValue(socket, RespValue::Error(msg));
     }
 
     static constexpr size_t kMaxConnectionBuffer = 64 * 1024 * 1024;
@@ -324,6 +461,9 @@ private:
     std::mutex clients_mu_;
     std::set<int> client_fds_;
     std::atomic<size_t> live_connections_{0};
+#ifdef KV_HAS_TLS
+    SSL_CTX* tls_ctx_ = nullptr;
+#endif
     // A tracked client handler plus a flag it sets on completion so the accept
     // loop can reap finished threads (list bounded by live connections).
     struct ClientConn {

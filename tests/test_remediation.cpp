@@ -36,6 +36,10 @@
 #include "util/crc32.h"
 #include "wal/wal.h"
 
+#ifdef KV_HAS_TLS
+#include <openssl/ssl.h>
+#endif
+
 using namespace kv;
 
 namespace {
@@ -145,6 +149,9 @@ public:
     }
     Status Close(FileHandle fh) override { return inner_.Close(fh); }
     Status Delete(std::string_view path) override { return inner_.Delete(path); }
+    Status Rename(std::string_view from, std::string_view to) override {
+        return inner_.Rename(from, to);
+    }
     Status FileSize(FileHandle fh, uint64_t* size) override {
         return inner_.FileSize(fh, size);
     }
@@ -179,6 +186,102 @@ private:
     SyncBackend inner_;
     std::atomic<int> sync_dir_calls_{0};
     std::atomic<bool> fail_dir_sync_{false};
+};
+
+class CrashBackend final : public IOBackend {
+public:
+    [[nodiscard]] std::string_view Name() const override { return "crash"; }
+
+    void arm(int syncs) { crash_at_ = sync_calls_ + syncs; }
+    [[nodiscard]] bool crashed() const { return crashed_; }
+
+    Status Open(std::string_view path, bool create, bool direct,
+                FileHandle* out) override {
+        std::string owned(path);
+        bool existed = std::filesystem::exists(owned);
+        auto s = inner_.Open(path, create, direct, out);
+        if (s.ok() && create && !existed) pending_creates_.insert(owned);
+        return s;
+    }
+    Status Close(FileHandle fh) override { return inner_.Close(fh); }
+    Status Delete(std::string_view path) override {
+        std::string owned(path);
+        if (std::filesystem::exists(owned)) {
+            pending_deletes_[owned] = ReadFile(owned);
+        }
+        return inner_.Delete(path);
+    }
+    Status Rename(std::string_view from, std::string_view to) override {
+        std::string from_str(from);
+        std::string to_str(to);
+        auto s = inner_.Rename(from, to);
+        if (s.ok()) pending_renames_.emplace_back(from_str, to_str);
+        return s;
+    }
+    Status FileSize(FileHandle fh, uint64_t* size) override {
+        return inner_.FileSize(fh, size);
+    }
+    Status Truncate(FileHandle fh, uint64_t size) override {
+        return inner_.Truncate(fh, size);
+    }
+    Status SyncDirectory(std::string_view path) override {
+        sync_calls_++;
+        if (crash_at_ >= 0 && sync_calls_ >= crash_at_) {
+            Crash();
+            return Status::IOError("simulated power loss");
+        }
+        ClearPending();
+        return inner_.SyncDirectory(path);
+    }
+    Status Read(FileHandle fh, uint64_t offset, void* buf, size_t len) override {
+        return inner_.Read(fh, offset, buf, len);
+    }
+    Status Write(FileHandle fh, uint64_t offset, const void* buf, size_t len) override {
+        return inner_.Write(fh, offset, buf, len);
+    }
+    Status Append(FileHandle fh, const void* buf, size_t len,
+                  uint64_t* offset) override {
+        return inner_.Append(fh, buf, len, offset);
+    }
+    Status Sync(FileHandle fh, bool data_only) override {
+        return inner_.Sync(fh, data_only);
+    }
+
+private:
+    void ClearPending() {
+        pending_creates_.clear();
+        pending_renames_.clear();
+        pending_deletes_.clear();
+    }
+
+    void Crash() {
+        if (crashed_) return;
+        crashed_ = true;
+        crash_at_ = -1;
+
+        for (auto& [path, data] : pending_deletes_) {
+            WriteFile(path, data);
+            pending_creates_.erase(path);
+        }
+        for (auto it = pending_renames_.rbegin(); it != pending_renames_.rend(); ++it) {
+            if (std::filesystem::exists(it->second) &&
+                !std::filesystem::exists(it->first)) {
+                std::filesystem::rename(it->second, it->first);
+            }
+        }
+        for (auto& path : pending_creates_) {
+            std::filesystem::remove(path);
+        }
+        ClearPending();
+    }
+
+    SyncBackend inner_;
+    std::set<std::string> pending_creates_;
+    std::vector<std::pair<std::string, std::string>> pending_renames_;
+    std::map<std::string, std::string> pending_deletes_;
+    int sync_calls_ = 0;
+    int crash_at_ = -1;
+    bool crashed_ = false;
 };
 
 class FailingTransport final : public RaftTransport {
@@ -788,3 +891,151 @@ TEST_CASE("backends: truncate and directory sync work on every implementation") 
 
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("WAL: a torn batch leaves no prefix") {
+    auto dir = MakeTempDir();
+    SyncBackend backend;
+
+    {
+        WAL wal(&backend, dir);
+        REQUIRE(wal.Open().ok());
+        REQUIRE(wal.AppendBatch({
+            {WALRecordType::kPut, "a", "1"},
+            {WALRecordType::kPut, "b", "2"},
+            {WALRecordType::kPut, "c", "3"},
+        }).ok());
+        REQUIRE(wal.Sync().ok());
+    }
+
+    auto path = dir + "/wal.log";
+    auto size = std::filesystem::file_size(path);
+    REQUIRE(size > 10);
+    std::filesystem::resize_file(path, size - 5);
+
+    {
+        WAL wal(&backend, dir);
+        REQUIRE(wal.Open().ok());
+        size_t replayed = 0;
+        REQUIRE(wal.Replay([&](const WALRecord&) { return true; }, &replayed).ok());
+        CHECK(replayed == 0);
+        REQUIRE(wal.Append({WALRecordType::kPut, "d", "4"}).ok());
+        REQUIRE(wal.Sync().ok());
+    }
+
+    {
+        WAL wal(&backend, dir);
+        REQUIRE(wal.Open().ok());
+        std::vector<std::string> keys;
+        REQUIRE(wal.Replay([&](const WALRecord& rec) {
+            keys.push_back(rec.key);
+            return true;
+        }).ok());
+        REQUIRE(keys.size() == 1);
+        CHECK(keys[0] == "d");
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("engine: PutBatch is recovered as one unit") {
+    auto dir = MakeTempDir();
+    EngineOptions opts;
+    opts.data_dir = dir;
+    opts.sync_wal = true;
+
+    {
+        auto backend = std::make_unique<SyncBackend>();
+        Engine engine(std::move(backend), opts);
+        REQUIRE(engine.Open().ok());
+        REQUIRE(engine.PutBatch({{"a", "1"}, {"b", "2"}, {"c", "3"}}).ok());
+    }
+
+    auto backend = std::make_unique<SyncBackend>();
+    Engine reopened(std::move(backend), opts);
+    REQUIRE(reopened.Open().ok());
+    CHECK(reopened.DbSize() == 3);
+    CHECK(reopened.Get("a") == std::optional<std::string>("1"));
+    CHECK(reopened.Get("b") == std::optional<std::string>("2"));
+    CHECK(reopened.Get("c") == std::optional<std::string>("3"));
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("power loss: flush recovers at every directory sync point") {
+    for (int crash_at : {1, 2, 0}) {
+        auto dir = MakeTempDir();
+        EngineOptions opts;
+        opts.data_dir = dir;
+        opts.sync_wal = true;
+
+        {
+            auto backend = std::make_unique<CrashBackend>();
+            auto* raw = backend.get();
+            Engine engine(std::move(backend), opts);
+            REQUIRE(engine.Open().ok());
+            if (crash_at > 0) raw->arm(crash_at);
+
+            REQUIRE(engine.Put("a", "1").ok());
+            REQUIRE(engine.Put("b", "2").ok());
+            auto flush_status = engine.FlushMemtable();
+            if (crash_at > 0) {
+                CHECK(!flush_status.ok());
+                CHECK(raw->crashed());
+            } else {
+                CHECK(flush_status.ok());
+                CHECK(!raw->crashed());
+            }
+        }
+
+        auto backend = std::make_unique<SyncBackend>();
+        Engine reopened(std::move(backend), opts);
+        REQUIRE(reopened.Open().ok());
+        CHECK(reopened.DbSize() == 2);
+        CHECK(reopened.Get("a") == std::optional<std::string>("1"));
+        CHECK(reopened.Get("b") == std::optional<std::string>("2"));
+
+        std::filesystem::remove_all(dir);
+    }
+}
+
+#ifdef KV_HAS_TLS
+TEST_CASE("server: TLS handshake and RESP roundtrip") {
+    auto dir = MakeTempDir();
+    auto backend = std::make_unique<SyncBackend>();
+    EngineOptions opts;
+    opts.data_dir = dir;
+    Engine engine(std::move(backend), opts);
+    REQUIRE(engine.Open().ok());
+
+    auto cert_dir = std::filesystem::absolute(__FILE__).parent_path() / "certs";
+    ServerOptions server_opts;
+    server_opts.port = 0;
+    server_opts.tls_cert = (cert_dir / "test-cert.pem").string();
+    server_opts.tls_key = (cert_dir / "test-key.pem").string();
+    Server server(engine, server_opts);
+    REQUIRE(server.Start().ok());
+    CHECK(server.tls_enabled());
+
+    int fd = Connect(server.bound_port());
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    REQUIRE(ctx != nullptr);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    SSL* ssl = SSL_new(ctx);
+    REQUIRE(ssl != nullptr);
+    SSL_set_fd(ssl, fd);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    auto command = BulkCommand({"PING"});
+    REQUIRE(SSL_write(ssl, command.data(), static_cast<int>(command.size())) > 0);
+    char reply[64];
+    int n = SSL_read(ssl, reply, sizeof(reply));
+    REQUIRE(n > 0);
+    CHECK(std::string(reply, static_cast<size_t>(n)) == "+PONG\r\n");
+
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    ::close(fd);
+    server.Stop();
+    std::filesystem::remove_all(dir);
+}
+#endif

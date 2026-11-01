@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdio>
+
 #include <cerrno>
 #include <cstring>
 #include <mutex>
@@ -60,6 +62,15 @@ public:
         std::string path_str(path);
         if (::unlink(path_str.c_str()) != 0 && errno != ENOENT) {
             return Status::IOError(std::string("unlink failed: ") + std::strerror(errno));
+        }
+        return Status::OK();
+    }
+
+    Status Rename(std::string_view from, std::string_view to) override {
+        std::string from_str(from);
+        std::string to_str(to);
+        if (::rename(from_str.c_str(), to_str.c_str()) != 0) {
+            return Status::IOError(std::string("rename failed: ") + std::strerror(errno));
         }
         return Status::OK();
     }

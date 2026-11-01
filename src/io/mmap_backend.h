@@ -65,6 +65,15 @@ public:
         return Status::OK();
     }
 
+    Status Rename(std::string_view from, std::string_view to) override {
+        std::string from_str(from);
+        std::string to_str(to);
+        if (::rename(from_str.c_str(), to_str.c_str()) != 0) {
+            return Status::IOError(std::string("rename: ") + std::strerror(errno));
+        }
+        return Status::OK();
+    }
+
     Status FileSize(FileHandle fh, uint64_t* size) override {
         std::lock_guard lock(mu_);
         auto it = files_.find(fh);

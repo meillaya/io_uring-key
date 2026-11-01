@@ -16,7 +16,7 @@ server, and Raft findings below.
 At the base commit the build reported 57 of 58 tests passing. The failure was
 the C++23 version check, which expected `__cplusplus >= 202302L`; GCC 13 reports
 `202100L`. After remediation the scaffold test is gone, and the suite passes
-74/74 without io_uring and 82/82 with it.
+77/77 by default, 78/78 with TLS, and 85/85 with io_uring.
 
 ## Summary
 
@@ -51,21 +51,21 @@ fix and regression test.
 | 7. Raft not in server | documented | The README and `DESIGN.md` now state that `kv_server` is single-node and Raft is a separate library. |
 | 8. Dev shell build mismatch | fixed | liburing requirement is 2.14, matching the pinned nixpkgs. Configured with a 2.14 version shim. |
 | 9. Benchmark is not YCSB | fixed | D reads the latest key, E scans 10 keys, F does read-modify-write, and the CSV records `sync_wal`. CSV regenerated. |
-| 10. Redis semantics | fixed | SET options are validated, EX is rejected, NX/XX use one engine lock, MSET uses a batch, DEL and MGET propagate errors, SELECT parses its index, SCAN is implemented. Command test. |
+| 10. Redis semantics | fixed | SET options are validated, EX is rejected, NX/XX use one engine lock, MSET writes one batch WAL record, DEL and MGET propagate errors, SELECT parses its index, SCAN is implemented. Command and batch tests. |
 | 11. Raft match index | fixed | Follower replies report the last covered index, not its tail. Match-index test. |
 | 12. Snapshot retry loop | fixed | An equal snapshot base returns success. Equal-base test. |
 | 13. RESP line growth | fixed | The parser rejects an unterminated line past 64 KiB and the server caps the connection buffer at 64 MiB. Long-line test. |
 | 14. SSTable offset validation | fixed | Footer offsets, index CRC, index bounds, bloom CRC, and block bounds are checked. Corruption tests. |
 | 15. Stray SSTable name | fixed | Sequence parsing uses `std::from_chars`; invalid names and `.tmp` files are ignored or removed. Startup test. |
 | 16. Invalid host binds all | fixed | `Server` and `TcpRaftTransport` check `inet_pton`. Invalid-host test. |
-| 17. No power-loss test | improved | SSTables are written as `.tmp`, renamed, and directory-synced; flush, compaction, and WAL truncation sync the directory. A fault-injection test covers the failure path. A real power-cut test is still absent. |
+| 17. No power-loss test | improved | SSTables are written as `.tmp`, renamed, and directory-synced; flush, compaction, and WAL truncation sync the directory. A fault-injecting backend drops unsynced directory entries at each sync point and checks recovery. A real hardware power-cut test is still absent. |
 
-The medium findings are also addressed: CI runs build, ASan/UBSan, and TSan; the
-scaffold tests are gone; compaction releases the SSTable lock during the merge;
-`DBSIZE` caches its count; connections have a limit, idle timeout, and optional
-password auth; `DbSize` serializes with writes; the log level is atomic; and
-the dead `src/net` placeholder is removed. TLS is still absent and is stated as
-a limit in the README.
+The medium findings are also addressed: CI runs build, ASan/UBSan, TSan, and a
+TLS build; the scaffold tests are gone; compaction releases the SSTable lock
+during the merge; `DBSIZE` caches its count; connections have a limit, idle
+timeout, and optional password auth; `DbSize` serializes with writes; the log
+level is atomic; and the dead `src/net` placeholder is removed. TLS is
+optional, enabled with `-DKV_ENABLE_TLS=ON`, and covered by a handshake test.
 
 ## Critical findings
 
@@ -338,21 +338,23 @@ truncating the WAL. Add a test that injects a crash between those steps.
 
 ## What the remediation changed
 
-- `WAL`: truncates torn tails, fsyncs the cut, and syncs the WAL directory.
-- `IOBackend`: added `Truncate` and `SyncDirectory` to all four backends.
+- `WAL`: truncates torn tails, fsyncs the cut, syncs the WAL directory, and
+  writes MSET as one CRC-protected batch record.
+- `IOBackend`: added `Truncate`, `Rename`, and `SyncDirectory` to all four
+  backends.
 - `Engine`: temp files with atomic rename, directory sync before WAL truncation,
   full level-0 merge, lock release during merge, conditional writes, batches,
   `Keys`, `Scan`, and a cached `DbSize`.
 - `SSTable`: bloom CRC and size checks, index CRC, footer range checks, bounded
   block parsing.
 - `Server`: socket tracking for shutdown, buffer cap, connection limit, idle
-  timeout, optional password auth, host validation.
+  timeout, optional password auth, host validation, and optional TLS.
 - `RESP`: unterminated line cap.
 - `Raft`: fail-closed state load, persistence checks, non-blocking RPC locks to
   avoid inline-transport ABBA, reply initialization, covered match index,
   idempotent snapshot install.
 - `Bench`: read-latest, scan, read-modify-write, sync policy flag, CSV column.
 - Build: liburing 2.14, sanitizer targets, pinned doctest, GitHub Actions CI.
-- Tests: `tests/test_remediation.cpp`, scaffold test removed, 82 cases with
-  io_uring and 74 without.
+- Tests: `tests/test_remediation.cpp`, scaffold test removed, 85 cases with
+  io_uring, 77 in the default build, and 78 with TLS.
 - Docs: README, `DESIGN.md`, and the figure source label updated.
