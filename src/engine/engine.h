@@ -9,11 +9,13 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "compaction/compaction.h"
+#include "engine/kv_store.h"
 #include "io/io_backend.h"
 #include "memtable/skiplist.h"
 #include "sstable/sstable.h"
@@ -30,7 +32,7 @@ struct EngineOptions {
     bool sync_wal = true;  // Fsync WAL on every write.
 };
 
-class Engine {
+class Engine : public KVStore {
 public:
     explicit Engine(std::unique_ptr<IOBackend> backend, EngineOptions opts)
         : backend_(std::move(backend)), opts_(std::move(opts)),
@@ -74,14 +76,14 @@ public:
         return Status::OK();
     }
 
-    Status Put(std::string_view key, std::string_view value) {
+    Status Put(std::string_view key, std::string_view value) override {
         std::lock_guard lock(write_mu_);
         return PutLocked(key, value);
     }
 
     // Put only when the key is absent. The check and the write share one write
     // lock, so two clients cannot both observe "absent" and both succeed.
-    Status PutIfAbsent(std::string_view key, std::string_view value, bool* inserted) {
+    Status PutIfAbsent(std::string_view key, std::string_view value, bool* inserted) override {
         std::lock_guard lock(write_mu_);
         std::optional<std::string> existing;
         auto s = Get(key, &existing);
@@ -96,7 +98,7 @@ public:
     }
 
     // Put only when the key exists. Same lock discipline as PutIfAbsent.
-    Status PutIfPresent(std::string_view key, std::string_view value, bool* inserted) {
+    Status PutIfPresent(std::string_view key, std::string_view value, bool* inserted) override {
         std::lock_guard lock(write_mu_);
         std::optional<std::string> existing;
         auto s = Get(key, &existing);
@@ -113,7 +115,7 @@ public:
     // Apply a batch of puts under one write lock and one WAL append. This is
     // the backing operation for MSET: other clients cannot observe a partial
     // batch, and one failed write rejects the whole call.
-    Status PutBatch(const std::vector<std::pair<std::string, std::string>>& entries) {
+    Status PutBatch(const std::vector<std::pair<std::string, std::string>>& entries) override {
         if (entries.empty()) return Status::OK();
 
         std::lock_guard lock(write_mu_);
@@ -142,7 +144,7 @@ public:
         return Status::OK();
     }
 
-    Status Delete(std::string_view key) {
+    Status Delete(std::string_view key) override {
         std::lock_guard lock(write_mu_);
         return DeleteLocked(key);
     }
@@ -151,7 +153,7 @@ public:
     // "corruption". Returns Status::OK() with *out set on a clean lookup
     // (nullopt *out == not found / tombstoned); returns Status::Corruption or
     // Status::IOError if an underlying SSTable read fails a CRC/IO check.
-    Status Get(std::string_view key, std::optional<std::string>* out) {
+    Status Get(std::string_view key, std::optional<std::string>* out) override {
         if (out) out->reset();
 
         // Check memtable first (most recent data). Load a stable snapshot of the
@@ -194,7 +196,7 @@ public:
     // Count live (non-tombstoned) keys across the memtable and SSTables.
     // The count is cached until the next write, so repeated DBSIZE calls do
     // not rescan every table.
-    Status DbSize(size_t* out) {
+    Status DbSize(size_t* out) override {
         if (!size_dirty_.load(std::memory_order_acquire)) {
             if (out) *out = cached_size_.load(std::memory_order_relaxed);
             return Status::OK();
@@ -222,43 +224,141 @@ public:
         return s.ok() ? count : 0;
     }
 
-    // Snapshot of all live keys, newest version wins. Used by SCAN.
-    Status Keys(std::vector<std::string>* out) {
-        std::lock_guard wlock(write_mu_);
-        return CollectLiveKeysLocked(out);
-    }
-
-    // Read up to `limit` live keys at or after `start`, in key order. Used by
-    // the short-range scan workload.
-    Status Scan(std::string_view start, size_t limit,
-                std::vector<std::pair<std::string, std::string>>* out) {
+    // Merge iterator over the memtable and every SSTable. It reads only the
+    // blocks it needs and never materializes the live-key set.
+    Status ScanAfter(std::string_view start, bool inclusive, size_t limit,
+                     std::vector<std::pair<std::string, std::string>>* out,
+                     bool* done = nullptr, std::string* cursor = nullptr) override {
         if (out == nullptr) return Status::InvalidArgument("scan output is null");
-        std::lock_guard wlock(write_mu_);
         out->clear();
+        if (done) *done = false;
+        if (cursor) cursor->clear();
         if (limit == 0) return Status::OK();
 
-        std::vector<std::string> keys;
-        auto s = CollectLiveKeysLocked(&keys);
-        if (!s.ok()) return s;
+        auto mt = memtable_.load(std::memory_order_acquire);
+        auto mem_entries = mt->Entries();
 
-        auto it = std::lower_bound(keys.begin(), keys.end(), start,
-                                   [](const std::string& key, std::string_view value) {
-                                       return key < value;
-                                   });
-        for (; it != keys.end() && out->size() < limit; ++it) {
-            std::optional<std::string> value;
-            s = Get(*it, &value);
-            if (!s.ok()) return s;
-            if (value.has_value()) {
-                out->emplace_back(*it, std::move(*value));
+        std::vector<std::shared_ptr<SSTableReader>> readers;
+        {
+            std::lock_guard lock(sst_mu_);
+            readers.reserve(sstables_.size());
+            for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
+                readers.push_back(it->reader);
+            }
+        }
+
+        struct Source {
+            int priority = 0;
+            bool is_memtable = false;
+            std::vector<MemtableEntry> mem;
+            size_t mem_pos = 0;
+            std::shared_ptr<SSTableReader> reader;
+            std::unique_ptr<SSTableReader::Iterator> sst;
+
+            [[nodiscard]] bool valid() const {
+                if (is_memtable) return mem_pos < mem.size();
+                return sst != nullptr && sst->valid();
+            }
+            [[nodiscard]] std::string_view key() const {
+                if (is_memtable) return mem[mem_pos].key;
+                return sst->key();
+            }
+            [[nodiscard]] std::string_view value() const {
+                if (is_memtable) return mem[mem_pos].value;
+                return sst->value();
+            }
+            [[nodiscard]] bool tombstone() const {
+                if (is_memtable) return mem[mem_pos].is_tombstone;
+                return sst->is_tombstone();
+            }
+            void Next() {
+                if (is_memtable) {
+                    mem_pos++;
+                } else {
+                    sst->Next();
+                }
+            }
+        };
+
+        std::vector<Source> sources;
+        sources.reserve(1 + readers.size());
+
+        Source mem_source;
+        mem_source.priority = 0;
+        mem_source.is_memtable = true;
+        mem_source.mem = std::move(mem_entries);
+        while (mem_source.mem_pos < mem_source.mem.size()) {
+            auto& key = mem_source.mem[mem_source.mem_pos].key;
+            if (key > start || (inclusive && key == start)) break;
+            mem_source.mem_pos++;
+        }
+        if (mem_source.valid()) sources.push_back(std::move(mem_source));
+
+        for (size_t i = 0; i < readers.size(); i++) {
+            Source source;
+            source.priority = static_cast<int>(i) + 1;
+            source.reader = readers[i];
+            source.sst = source.reader->NewIterator(start, inclusive);
+            if (!source.sst->status().ok()) return source.sst->status();
+            if (source.sst->valid()) sources.push_back(std::move(source));
+        }
+
+        if (sources.empty()) {
+            if (done) *done = true;
+            return Status::OK();
+        }
+
+        auto compare = [&sources](size_t left, size_t right) {
+            auto left_key = sources[left].key();
+            auto right_key = sources[right].key();
+            if (left_key != right_key) return left_key > right_key;
+            return sources[left].priority > sources[right].priority;
+        };
+        std::priority_queue<size_t, std::vector<size_t>, decltype(compare)>
+            heap(compare);
+        for (size_t i = 0; i < sources.size(); i++) heap.push(i);
+
+        std::string last_key;
+        while (!heap.empty() && out->size() < limit) {
+            std::string key(sources[heap.top()].key());
+            std::vector<size_t> same_key;
+            while (!heap.empty() && sources[heap.top()].key() == key) {
+                same_key.push_back(heap.top());
+                heap.pop();
+            }
+
+            // The first entry has the newest source priority.
+            bool tombstone = sources[same_key.front()].tombstone();
+            std::string value(sources[same_key.front()].value());
+            for (size_t index : same_key) {
+                sources[index].Next();
+                if (sources[index].valid()) heap.push(index);
+            }
+
+            last_key = std::move(key);
+            if (!tombstone) out->emplace_back(last_key, std::move(value));
+        }
+
+        if (done) *done = heap.empty();
+        if (cursor) *cursor = last_key;
+
+        for (auto& source : sources) {
+            if (source.sst != nullptr && !source.sst->status().ok()) {
+                return source.sst->status();
             }
         }
         return Status::OK();
     }
 
+    // Read up to `limit` live keys at or after `start`.
+    Status Scan(std::string_view start, size_t limit,
+                std::vector<std::pair<std::string, std::string>>* out) {
+        return ScanAfter(start, true, limit, out, nullptr, nullptr);
+    }
+
     // FLUSHDB (G008): delete ALL data. Clear the active memtable, remove every
     // SSTable file, and truncate the WAL. Scoped to this engine's data dir.
-    Status Clear() {
+    Status Clear() override {
         std::lock_guard wlock(write_mu_);
 
         // 1. Reset the memtable (swap in a fresh empty one; in-flight readers
@@ -313,15 +413,16 @@ public:
     }
 
     // Force flush + sync (for clean shutdown).
-    Status FlushAndSync() {
+    Status FlushAndSync() override {
         std::lock_guard lock(write_mu_);
         auto s = FlushMemtableLocked();
         if (!s.ok()) return s;
         return wal_.Sync();
     }
 
-    [[nodiscard]] IOBackend* backend() { return backend_.get(); }
+    [[nodiscard]] IOBackend* backend() override { return backend_.get(); }
     [[nodiscard]] const EngineOptions& options() const { return opts_; }
+    [[nodiscard]] bool is_leader() const override { return true; }
 
 private:
     struct SSTableHandle {
@@ -329,7 +430,7 @@ private:
         uint64_t file_size;
         int level;
         uint64_t sequence;
-        std::unique_ptr<SSTableReader> reader;
+        std::shared_ptr<SSTableReader> reader;
     };
 
     Status PutLocked(std::string_view key, std::string_view value) {
@@ -402,7 +503,7 @@ private:
         s = backend_->SyncDirectory(opts_.data_dir);
         if (!s.ok()) return s;
 
-        auto reader = std::make_unique<SSTableReader>(backend_.get(), sst_path);
+        auto reader = std::make_shared<SSTableReader>(backend_.get(), sst_path);
         s = reader->Open();
         if (!s.ok()) return s;
 
@@ -476,7 +577,7 @@ private:
         s = backend_->SyncDirectory(opts_.data_dir);
         if (!s.ok()) return s;
 
-        auto reader = std::make_unique<SSTableReader>(backend_.get(), output_path);
+        auto reader = std::make_shared<SSTableReader>(backend_.get(), output_path);
         s = reader->Open();
         if (!s.ok()) return s;
 
@@ -588,7 +689,7 @@ private:
         std::sort(sst_files.begin(), sst_files.end());
 
         for (auto& [seq, path] : sst_files) {
-            auto reader = std::make_unique<SSTableReader>(backend_.get(), path);
+            auto reader = std::make_shared<SSTableReader>(backend_.get(), path);
             auto s = reader->Open();
             if (!s.ok()) {
                 return Status::Corruption("open SSTable " + path + ": " +

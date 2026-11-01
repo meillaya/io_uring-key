@@ -30,6 +30,7 @@
 #include "io/iouring_backend.h"
 #endif
 #include "raft/raft.h"
+#include "raft/raft_store.h"
 #include "server/command_handler.h"
 #include "server/server.h"
 #include "sstable/sstable.h"
@@ -1039,3 +1040,142 @@ TEST_CASE("server: TLS handshake and RESP roundtrip") {
     std::filesystem::remove_all(dir);
 }
 #endif
+
+TEST_CASE("engine: scan merges sources, skips tombstones, and seeks") {
+    auto dir = MakeTempDir();
+    auto backend = std::make_unique<SyncBackend>();
+    EngineOptions opts;
+    opts.data_dir = dir;
+    opts.sync_wal = false;
+    Engine engine(std::move(backend), opts);
+    REQUIRE(engine.Open().ok());
+
+    REQUIRE(engine.Put("b", "old").ok());
+    REQUIRE(engine.FlushMemtable().ok());
+    REQUIRE(engine.Put("b", "new").ok());
+    REQUIRE(engine.Put("a", "1").ok());
+    REQUIRE(engine.FlushMemtable().ok());
+    REQUIRE(engine.Put("c", "3").ok());
+    REQUIRE(engine.Put("d", "4").ok());
+    REQUIRE(engine.Delete("a").ok());
+
+    std::vector<std::pair<std::string, std::string>> rows;
+    REQUIRE(engine.Scan("", 10, &rows).ok());
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0].first == "b");
+    CHECK(rows[0].second == "new");
+    CHECK(rows[1].first == "c");
+    CHECK(rows[2].first == "d");
+
+    rows.clear();
+    REQUIRE(engine.ScanAfter("b", false, 10, &rows).ok());
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].first == "c");
+    CHECK(rows[1].first == "d");
+
+    rows.clear();
+    REQUIRE(engine.ScanAfter("a", false, 2, &rows).ok());
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].first == "b");
+    CHECK(rows[1].first == "c");
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("commands: SCAN cursor pages over every live key") {
+    auto dir = MakeTempDir();
+    auto backend = std::make_unique<SyncBackend>();
+    EngineOptions opts;
+    opts.data_dir = dir;
+    opts.sync_wal = false;
+    Engine engine(std::move(backend), opts);
+    REQUIRE(engine.Open().ok());
+    CommandHandler handler(engine);
+
+    for (std::string key : {"a", "b", "c", "d", "e"}) {
+        REQUIRE(handler.Execute({"SET", key, key}).type == RespType::kSimpleString);
+    }
+    REQUIRE(handler.Execute({"DEL", "b"}).integer == 1);
+
+    std::set<std::string> seen;
+    std::string cursor = "0";
+    for (int page = 0; page < 10; page++) {
+        auto reply = handler.Execute({"SCAN", cursor, "COUNT", "2"});
+        REQUIRE(reply.array.size() == 2);
+        auto keys = RespStrings(reply.array[1]);
+        for (auto& key : keys) {
+            CHECK(seen.insert(key).second);
+        }
+        cursor = reply.array[0].str;
+        if (cursor == "0") break;
+    }
+
+    CHECK(seen == std::set<std::string>({"a", "c", "d", "e"}));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("raft store: single node writes through the log and restarts") {
+    auto dir = MakeTempDir();
+    EngineOptions opts;
+    opts.data_dir = dir;
+    opts.sync_wal = true;
+
+    auto make_config = [&] {
+        RaftConfig config;
+        config.node_id = "n1";
+        config.peers = {"n1"};
+        config.data_dir = dir;
+        config.election_timeout_min_ms = 30;
+        config.election_timeout_max_ms = 60;
+        config.heartbeat_interval_ms = 10;
+        return config;
+    };
+
+    {
+        auto engine = std::make_unique<Engine>(std::make_unique<SyncBackend>(), opts);
+        RaftStore store(std::move(engine), make_config(), "127.0.0.1", 0, {},
+                        std::chrono::milliseconds(2000));
+        REQUIRE(store.Start().ok());
+
+        for (int i = 0; i < 200 && !store.is_leader(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        REQUIRE(store.is_leader());
+        std::optional<std::string> missing;
+        CHECK(store.Get("missing", &missing).ok());
+        CHECK(!missing.has_value());
+
+        REQUIRE(store.Put("a", "1").ok());
+        REQUIRE(store.Put("b", "2").ok());
+        REQUIRE(store.Delete("a").ok());
+
+        auto value = store.Get("b");
+        REQUIRE(value.has_value());
+        CHECK(*value == "2");
+        CHECK(!store.Get("a").has_value());
+
+        bool inserted = false;
+        CHECK(store.PutIfAbsent("c", "3", &inserted).code() ==
+              StatusCode::kNotSupported);
+        store.Stop();
+    }
+
+    {
+        auto engine = std::make_unique<Engine>(std::make_unique<SyncBackend>(), opts);
+        RaftStore store(std::move(engine), make_config(), "127.0.0.1", 0, {},
+                        std::chrono::milliseconds(2000));
+        REQUIRE(store.Start().ok());
+        for (int i = 0; i < 200 && !store.is_leader(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        REQUIRE(store.is_leader());
+
+        auto value = store.Get("b");
+        REQUIRE(value.has_value());
+        CHECK(*value == "2");
+        CHECK(!store.Get("a").has_value());
+        store.Stop();
+    }
+
+    std::filesystem::remove_all(dir);
+}

@@ -581,6 +581,160 @@ public:
         return Status::OK();
     }
 
+    // A forward iterator over the table's sorted entries. It reads one block
+    // at a time and can seek to a start key, so a scan does not load the whole
+    // table into memory.
+    class Iterator {
+    public:
+        Iterator(SSTableReader* reader, std::string_view start, bool inclusive)
+            : reader_(reader) {
+            Seek(start, inclusive);
+        }
+
+        [[nodiscard]] bool valid() const { return valid_; }
+        [[nodiscard]] std::string_view key() const { return key_; }
+        [[nodiscard]] std::string_view value() const { return value_; }
+        [[nodiscard]] bool is_tombstone() const { return tombstone_; }
+        [[nodiscard]] const Status& status() const { return status_; }
+
+        void Next() {
+            if (!valid_) return;
+            if (!Advance()) valid_ = false;
+        }
+
+    private:
+        void Seek(std::string_view start, bool inclusive) {
+            valid_ = false;
+            status_ = Status::OK();
+            block_loaded_ = false;
+            if (reader_->index_.empty()) return;
+
+            int lo = 0;
+            int hi = static_cast<int>(reader_->index_.size()) - 1;
+            int target = -1;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                if (reader_->index_[mid].last_key >= start) {
+                    target = mid;
+                    hi = mid - 1;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            if (target < 0) return;
+            if (!LoadBlock(static_cast<size_t>(target))) return;
+
+            while (Advance()) {
+                if (key_ > start || (inclusive && key_ == start)) return;
+            }
+            valid_ = false;
+        }
+
+        bool LoadBlock(size_t index) {
+            if (index >= reader_->index_.size()) return false;
+            const auto& entry = reader_->index_[index];
+            if (entry.size < 8) {
+                status_ = Status::Corruption("block too small");
+                return false;
+            }
+
+            block_data_.resize(entry.size);
+            auto s = reader_->backend_->Read(reader_->fh_, entry.offset,
+                                             block_data_.data(), entry.size);
+            if (!s.ok()) {
+                status_ = s;
+                return false;
+            }
+
+            uint32_t stored_crc = 0;
+            std::memcpy(&stored_crc, block_data_.data() + block_data_.size() - 4, 4);
+            uint32_t computed_crc = CRC32::Compute(block_data_.data(),
+                                                   block_data_.size() - 4);
+            if (stored_crc != computed_crc) {
+                status_ = Status::Corruption("block CRC mismatch");
+                return false;
+            }
+
+            uint32_t count = 0;
+            std::memcpy(&count, block_data_.data(), 4);
+            entry_count_ = count;
+            entry_index_ = 0;
+            entry_pos_ = 4;
+            block_index_ = index;
+            block_loaded_ = true;
+            return true;
+        }
+
+        bool Advance() {
+            while (true) {
+                if (!block_loaded_ || entry_index_ >= entry_count_) {
+                    size_t next = block_loaded_ ? block_index_ + 1 : 0;
+                    if (!LoadBlock(next)) return false;
+                }
+
+                if (entry_pos_ + 4 > block_data_.size() - 4) {
+                    status_ = Status::Corruption("truncated entry key length");
+                    return false;
+                }
+                uint32_t klen = 0;
+                std::memcpy(&klen, block_data_.data() + entry_pos_, 4);
+                entry_pos_ += 4;
+                if (entry_pos_ > block_data_.size() - 4 ||
+                    klen > block_data_.size() - 4 - entry_pos_) {
+                    status_ = Status::Corruption("invalid entry key length");
+                    return false;
+                }
+                key_.assign(reinterpret_cast<const char*>(block_data_.data() + entry_pos_),
+                            klen);
+                entry_pos_ += klen;
+
+                if (entry_pos_ >= block_data_.size() - 4) {
+                    status_ = Status::Corruption("truncated tombstone flag");
+                    return false;
+                }
+                tombstone_ = block_data_[entry_pos_] != 0;
+                entry_pos_ += 1;
+
+                if (entry_pos_ + 4 > block_data_.size() - 4) {
+                    status_ = Status::Corruption("truncated entry value length");
+                    return false;
+                }
+                uint32_t vlen = 0;
+                std::memcpy(&vlen, block_data_.data() + entry_pos_, 4);
+                entry_pos_ += 4;
+                if (entry_pos_ > block_data_.size() - 4 ||
+                    vlen > block_data_.size() - 4 - entry_pos_) {
+                    status_ = Status::Corruption("invalid entry value length");
+                    return false;
+                }
+                value_.assign(reinterpret_cast<const char*>(block_data_.data() + entry_pos_),
+                              vlen);
+                entry_pos_ += vlen;
+
+                entry_index_++;
+                valid_ = true;
+                return true;
+            }
+        }
+
+        SSTableReader* reader_;
+        size_t block_index_ = 0;
+        bool block_loaded_ = false;
+        std::vector<uint8_t> block_data_;
+        size_t entry_pos_ = 0;
+        uint32_t entry_count_ = 0;
+        uint32_t entry_index_ = 0;
+        bool valid_ = false;
+        bool tombstone_ = false;
+        std::string key_;
+        std::string value_;
+        Status status_;
+    };
+
+    std::unique_ptr<Iterator> NewIterator(std::string_view start, bool inclusive) {
+        return std::make_unique<Iterator>(this, start, inclusive);
+    }
+
     [[nodiscard]] size_t num_blocks() const { return index_.size(); }
 
 private:

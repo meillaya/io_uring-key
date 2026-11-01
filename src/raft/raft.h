@@ -214,6 +214,54 @@ public:
         return Status::OK();
     }
 
+    // Propose and wait until the entry is applied, the node loses leadership,
+    // or the deadline expires. A timeout does not prove the write failed: the
+    // entry can still commit later, so callers should use idempotent keys.
+    Status ProposeAndWait(const std::string& key, const std::string& value,
+                          bool is_delete, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mu_);
+        if (state_ != RaftState::kLeader) {
+            return Status::NotSupported("not the leader");
+        }
+
+        LogEntry entry{};
+        entry.term = current_term_;
+        entry.index = log_.empty() ? 1 : log_.back().index + 1;
+        entry.key = key;
+        entry.value = value;
+        entry.is_delete = is_delete;
+        log_.push_back(entry);
+
+        if (config_.peers.size() == 1) {
+            uint64_t old_commit = commit_index_;
+            commit_index_ = entry.index;
+            auto persisted = PersistState();
+            if (!persisted.ok()) {
+                log_.pop_back();
+                commit_index_ = old_commit;
+                return persisted;
+            }
+            ApplyCommitted();
+            return Status::OK();
+        }
+
+        auto persisted = PersistState();
+        if (!persisted.ok()) {
+            log_.pop_back();
+            return persisted;
+        }
+        ReplicateToPeers();
+
+        cv_.wait_for(lock, timeout, [&] {
+            return last_applied_ >= entry.index || state_ != RaftState::kLeader;
+        });
+        if (last_applied_ >= entry.index) return Status::OK();
+        if (state_ != RaftState::kLeader) {
+            return Status::NotSupported("lost leadership before commit");
+        }
+        return Status::IOError("commit timeout");
+    }
+
     // Read a value (leader-only). Served directly from the leader's in-memory
     // state machine under a leader-lease assumption: we do NOT run a ReadIndex
     // heartbeat-confirm round before reading, so this is a leader-lease read,
@@ -781,6 +829,7 @@ private:
                 if (apply_cb_) apply_cb_(*entry);
             }
         }
+        cv_.notify_all();
     }
 
     std::optional<LogEntry> FindLogEntry(uint64_t index) {

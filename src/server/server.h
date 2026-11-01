@@ -27,7 +27,7 @@
 #include <openssl/ssl.h>
 #endif
 
-#include "engine/engine.h"
+#include "engine/kv_store.h"
 #include "server/command_handler.h"
 #include "server/resp.h"
 #include "util/logging.h"
@@ -47,7 +47,7 @@ struct ServerOptions {
 
 class Server {
 public:
-    Server(Engine& engine, ServerOptions opts = {})
+    Server(KVStore& engine, ServerOptions opts = {})
         : engine_(engine), handler_(engine), opts_(std::move(opts)),
           listen_fd_(-1), running_(false) {}
 
@@ -452,7 +452,7 @@ private:
 
     static constexpr size_t kMaxConnectionBuffer = 64 * 1024 * 1024;
 
-    Engine& engine_;
+    KVStore& engine_;
     CommandHandler handler_;
     ServerOptions opts_;
     std::atomic<int> listen_fd_;

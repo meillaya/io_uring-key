@@ -1,5 +1,6 @@
-// kernel-v2: io_uring-based log-structured KV store with Redis-compatible API.
+// kernel-v2: io_uring-based log-structured KV store with a Redis-compatible API.
 
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -8,9 +9,14 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 #include "engine/engine.h"
+#include "engine/kv_store.h"
 #include "io/sync_backend.h"
+#include "raft/raft_store.h"
 #include "server/server.h"
 
 #ifdef KV_HAS_IOURING
@@ -22,6 +28,26 @@ using namespace kv;
 static volatile sig_atomic_t g_shutdown = 0;
 
 static void SignalHandler(int) { g_shutdown = 1; }
+
+static bool ParsePeer(std::string_view text, RaftStore::Peer* peer) {
+    auto at = text.find('@');
+    if (at == std::string_view::npos) return false;
+    auto colon = text.rfind(':');
+    if (colon == std::string_view::npos || colon <= at + 1) return false;
+
+    peer->id = std::string(text.substr(0, at));
+    peer->host = std::string(text.substr(at + 1, colon - at - 1));
+    if (peer->id.empty() || peer->host.empty()) return false;
+
+    try {
+        int parsed = std::stoi(std::string(text.substr(colon + 1)));
+        if (parsed < 0 || parsed > 65535) return false;
+        peer->port = static_cast<uint16_t>(parsed);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
 
 int main(int argc, char* argv[]) {
     std::string data_dir = "/tmp/kv_server_data";
@@ -37,6 +63,12 @@ int main(int argc, char* argv[]) {
     size_t max_connections = 1024;
     int idle_timeout_ms = 300000;
 
+    std::string raft_id;
+    std::string raft_host = "127.0.0.1";
+    uint16_t raft_port = 7000;
+    std::vector<RaftStore::Peer> raft_peers;
+    int raft_commit_timeout_ms = 5000;
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--data-dir" && i + 1 < argc) data_dir = argv[++i];
@@ -44,6 +76,25 @@ int main(int argc, char* argv[]) {
         else if (arg == "--requirepass" && i + 1 < argc) requirepass = argv[++i];
         else if (arg == "--tls-cert" && i + 1 < argc) tls_cert = argv[++i];
         else if (arg == "--tls-key" && i + 1 < argc) tls_key = argv[++i];
+        else if (arg == "--raft-id" && i + 1 < argc) raft_id = argv[++i];
+        else if (arg == "--raft-host" && i + 1 < argc) raft_host = argv[++i];
+        else if (arg == "--raft-peer" && i + 1 < argc) {
+            RaftStore::Peer peer;
+            if (!ParsePeer(argv[++i], &peer)) {
+                std::fprintf(stderr, "Invalid --raft-peer (expected id@host:port)\n");
+                return 1;
+            }
+            raft_peers.push_back(std::move(peer));
+        }
+        else if (arg == "--raft-commit-timeout-ms" && i + 1 < argc) {
+            try {
+                raft_commit_timeout_ms = std::stoi(argv[++i]);
+                if (raft_commit_timeout_ms <= 0) throw std::out_of_range("non-positive");
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --raft-commit-timeout-ms\n");
+                return 1;
+            }
+        }
         else if (arg == "--max-connections" && i + 1 < argc) {
             try {
                 max_connections = static_cast<size_t>(std::stoul(argv[++i]));
@@ -62,18 +113,22 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (arg == "--port" && i + 1 < argc) {
-            const std::string port_str = argv[++i];
             try {
-                int parsed = std::stoi(port_str);
-                if (parsed < 0 || parsed > 65535) {
-                    std::fprintf(stderr, "Invalid --port '%s' (expected 0-65535)\n",
-                                 port_str.c_str());
-                    return 1;
-                }
+                int parsed = std::stoi(argv[++i]);
+                if (parsed < 0 || parsed > 65535) throw std::out_of_range("port");
                 port = static_cast<uint16_t>(parsed);
             } catch (const std::exception&) {
-                std::fprintf(stderr, "Invalid --port '%s' (expected 0-65535)\n",
-                             port_str.c_str());
+                std::fprintf(stderr, "Invalid --port (expected 0-65535)\n");
+                return 1;
+            }
+        }
+        else if (arg == "--raft-port" && i + 1 < argc) {
+            try {
+                int parsed = std::stoi(argv[++i]);
+                if (parsed < 0 || parsed > 65535) throw std::out_of_range("port");
+                raft_port = static_cast<uint16_t>(parsed);
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "Invalid --raft-port (expected 0-65535)\n");
                 return 1;
             }
         }
@@ -82,6 +137,11 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "Unknown or incomplete option: %s\n", arg.c_str());
             return 1;
         }
+    }
+
+    if (raft_peers.size() > 0 && raft_id.empty()) {
+        std::fprintf(stderr, "--raft-peer requires --raft-id\n");
+        return 1;
     }
 
     std::signal(SIGINT, SignalHandler);
@@ -94,8 +154,10 @@ int main(int argc, char* argv[]) {
 #ifdef KV_HAS_IOURING
     else if (backend_name == "io_uring") {
         auto b = std::make_unique<IOUringBackend>();
-        if (!b->Init().ok()) {
-            std::fprintf(stderr, "Failed to init io_uring backend\n");
+        auto s = b->Init();
+        if (!s.ok()) {
+            std::fprintf(stderr, "Failed to init io_uring backend: %s\n",
+                         s.ToString().c_str());
             return 1;
         }
         backend = std::move(b);
@@ -110,11 +172,43 @@ int main(int argc, char* argv[]) {
     opts.data_dir = data_dir;
     opts.sync_wal = true;
 
-    Engine engine(std::move(backend), opts);
-    auto s = engine.Open();
-    if (!s.ok()) {
-        std::fprintf(stderr, "Failed to open engine: %s\n", s.ToString().c_str());
-        return 1;
+    std::unique_ptr<KVStore> store;
+    std::unique_ptr<RaftStore> raft_store;
+    uint16_t bound_raft_port = 0;
+
+    if (raft_id.empty()) {
+        auto engine = std::make_unique<Engine>(std::move(backend), opts);
+        auto s = engine->Open();
+        if (!s.ok()) {
+            std::fprintf(stderr, "Failed to open engine: %s\n", s.ToString().c_str());
+            return 1;
+        }
+        store = std::move(engine);
+    } else {
+        RaftConfig config;
+        config.node_id = raft_id;
+        config.data_dir = data_dir;
+        config.peers.push_back(raft_id);
+        for (auto& peer : raft_peers) {
+            bool known = false;
+            for (auto& id : config.peers) {
+                if (id == peer.id) known = true;
+            }
+            if (!known) config.peers.push_back(peer.id);
+        }
+
+        auto engine = std::make_unique<Engine>(std::move(backend), opts);
+        raft_store = std::make_unique<RaftStore>(
+            std::move(engine), std::move(config), raft_host, raft_port,
+            std::move(raft_peers),
+            std::chrono::milliseconds(raft_commit_timeout_ms));
+        auto s = raft_store->Start();
+        if (!s.ok()) {
+            std::fprintf(stderr, "Failed to start Raft store: %s\n", s.ToString().c_str());
+            return 1;
+        }
+        bound_raft_port = raft_store->raft_port();
+        store = std::move(raft_store);
     }
 
     ServerOptions server_opts;
@@ -126,10 +220,11 @@ int main(int argc, char* argv[]) {
     server_opts.tls_cert = tls_cert;
     server_opts.tls_key = tls_key;
 
-    Server server(engine, server_opts);
-    s = server.Start();
+    Server server(*store, server_opts);
+    auto s = server.Start();
     if (!s.ok()) {
         std::fprintf(stderr, "Failed to start server: %s\n", s.ToString().c_str());
+        store->FlushAndSync();
         return 1;
     }
 
@@ -137,6 +232,10 @@ int main(int argc, char* argv[]) {
                 host.c_str(), port, backend_name.c_str(), data_dir.c_str(),
                 requirepass.empty() ? "off" : "on",
                 tls_cert.empty() ? "off" : "on");
+    if (!raft_id.empty()) {
+        std::printf("Raft node %s on %s:%u\n", raft_id.c_str(), raft_host.c_str(),
+                    bound_raft_port);
+    }
     std::printf("Press Ctrl+C to stop.\n");
 
     while (!g_shutdown) {
@@ -145,6 +244,7 @@ int main(int argc, char* argv[]) {
 
     std::printf("\nShutting down...\n");
     server.Stop();
-    engine.FlushAndSync();
+    store->FlushAndSync();
+    store.reset();
     return 0;
 }

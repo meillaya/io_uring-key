@@ -1,6 +1,6 @@
 <h1 align="center" style="letter-spacing: 0.12em;">io_uring-key</h1>
 
-<p align="center">A C++23 log-structured key-value store with a RESP2 server, four I/O backends, and a standalone Raft library.</p>
+<p align="center">A C++23 log-structured key-value store with a RESP2 server, four I/O backends, and optional Raft mode.</p>
 
 <br>
 
@@ -12,8 +12,8 @@ SSTables, and level-0 full compaction. Four backends implement one I/O
 interface: `sync`, `threadpool`, `mmap`, and `io_uring`.
 
 The repository also contains a Raft consensus library, a YCSB-inspired benchmark
-harness, and a chart script. The server does not start the Raft library. The
-source and runtime messages use the internal name `kernel-v2`.
+harness, and a chart script. `kv_server` can run standalone or as a Raft node.
+The source and runtime messages use the internal name `kernel-v2`.
 
 This is a research prototype for systems programmers. It has known gaps. Read
 [Limits](#limits) before you trust it with data.
@@ -39,6 +39,15 @@ ctest --test-dir build --output-on-failure
 
 For TLS, configure with `-DKV_ENABLE_TLS=ON` and pass `--tls-cert` and
 `--tls-key` when starting the server.
+
+For a single-node Raft server, add `--raft-id` and `--raft-port`:
+
+```bash
+./build/kv_server --port 6379 --backend sync --data-dir /tmp/kv_raft \
+  --raft-id n1 --raft-host 127.0.0.1 --raft-port 7001
+```
+
+Add one `--raft-peer id@host:port` per node, including self, for a cluster.
 
 Start the server in one terminal:
 
@@ -67,9 +76,9 @@ skips the WAL fsync and records that policy in the CSV.
 
 ![Architecture](docs/figures/architecture.png)
 
-`kv_server` reads and writes through the LSM engine and one I/O backend. The
-Raft code is a separate library in `src/raft`; the server never starts it. The
-figure source and render command are in
+`kv_server` reads and writes through the LSM engine and one I/O backend. In
+Raft mode, writes commit through the Raft log first and the committed entries
+are applied to the engine. The figure source and render command are in
 [docs/figures/README.md](docs/figures/README.md).
 
 ## What works
@@ -87,8 +96,9 @@ figure source and render command are in
   `-DKV_ENABLE_TLS=ON` and at runtime with `--tls-cert` and `--tls-key`.
 - Server controls: optional shared-password auth, a connection limit, and an
   idle timeout. Set `--requirepass secret` or `KV_REQUIREPASS` to enable auth.
-- Raft library: elections, log replication, a persistent log, snapshots, and a
-  TCP transport. Unit and in-process cluster tests cover it.
+- Raft mode: `--raft-id` starts a Raft node, routes writes through the log,
+  and applies committed entries to the engine. Elections, replication,
+  snapshots, and the TCP transport are covered by tests.
 - Benchmarks: YCSB-inspired A to F, including read-latest (D), 10-key scans
   (E), and read-modify-write (F). CSV export and matplotlib charts.
 
@@ -97,12 +107,16 @@ figure source and render command are in
 - `SET ... EX` is rejected with an error. TTL is not implemented.
 - `MSET` is one batch WAL record. A torn batch is discarded as a unit, so it
   does not leave a prefix. A crash after a full batch is recovered as a batch.
-- The Raft library is not part of the server. The leader serves reads without a
-  ReadIndex confirmation.
+- In Raft mode, writes are leader-only and reads are leader-only. Followers
+  reject commands with `NotSupported: not the leader`; there is no redirect.
+- Raft mode rejects `SET NX/XX`, `MSET`, and `FLUSHDB`. Reads use a leader
+  lease, not a ReadIndex confirmation.
+- A Raft commit timeout returns an error, but the entry can still commit later.
+- The Raft tests use sleeps and are timing-sensitive.
 - TLS is optional. Without `--tls-cert` and `--tls-key`, `AUTH` is a shared
   password over plain TCP, so do not expose that mode to an untrusted network.
-- `SCAN` and benchmark workload E collect every live key for each call. They are
-  correct at small scale and do not scale with the dataset.
+- `SCAN` uses an opaque hex key as its cursor, not a numeric Redis cursor.
+  Writes between pages can appear or disappear.
 - The benchmark uses uniform keys, not the Zipfian distribution of the default
   YCSB driver.
 - Crash tests use SIGKILL. Directory fsync is covered by a fault-injection test,
@@ -116,15 +130,16 @@ vCPUs. All rows use `sync_wal=false`.
 
 | Backend | A | B | C | D | E | F |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `sync` | 1.00M | 3.13M | 5.65M | 3.84M | 14.3k | 911.5k |
-| `threadpool` | 63.8k | 530.7k | 5.41M | 600.9k | 13.6k | 68.4k |
-| `mmap` | 45.7k | 395.1k | 5.49M | 428.5k | 13.5k | 44.6k |
-| `io_uring` | 90.8k | 732.2k | 5.47M | 693.3k | 13.5k | 81.7k |
+| `sync` | 1.00M | 3.21M | 5.93M | 3.86M | 47.2k | 907.5k |
+| `threadpool` | 71.9k | 591.1k | 5.77M | 642.2k | 38.2k | 70.9k |
+| `mmap` | 46.0k | 406.2k | 5.70M | 481.3k | 37.5k | 48.2k |
+| `io_uring` | 92.6k | 722.4k | 5.50M | 795.9k | 37.6k | 88.6k |
 
 A is 50/50 read/write, B is 95/5, C is read-only, D reads the latest key, E
 spends 95% of operations on 10-key scans, and F spends 50% on read-modify-write.
-The scan numbers are low because each scan rebuilds the live-key set. Treat the
-table as a smoke benchmark, not a production comparison.
+The scan path merges the memtable and SSTables one block at a time, so E stays
+slower than point reads but no longer rebuilds the full key set. Treat the table
+as a smoke benchmark, not a production comparison.
 
 ## Layout
 
@@ -141,19 +156,19 @@ table as a smoke benchmark, not a production comparison.
 
 ## Tests
 
-`ctest --test-dir build` runs 77 doctest cases in the default build, 78 with
-TLS, and 85 with the io_uring backend. The suite covers WAL tail repair, batch
+`ctest --test-dir build` runs 80 doctest cases in the default build, 81 with
+TLS, and 88 with the io_uring backend. The suite covers WAL tail repair, batch
 WAL recovery, randomized engine operations against `std::map`, SIGKILL
 recovery, simulated power loss, directory fsync ordering, RESP parsing,
-malformed socket input, compaction, concurrent readers, Raft persistence and
-snapshots, a three-node TCP cluster, and a TLS handshake.
+malformed socket input, merge scans, compaction, concurrent readers, Raft
+persistence and snapshots, a three-node TCP cluster, and a TLS handshake.
 
-CI runs the default 77-case build, AddressSanitizer with UndefinedBehaviorSanitizer,
-ThreadSanitizer, and a TLS build. Run the 85-case io_uring suite on a Linux host.
+CI runs the default 80-case build, AddressSanitizer with UndefinedBehaviorSanitizer,
+ThreadSanitizer, and a TLS build. Run the 88-case io_uring suite on a Linux host.
 
 The crash tests use SIGKILL, and the power-loss test uses a fault-injecting
 backend that drops unsynced directory entries. Neither is a real hardware power
-cut. The Raft tests use sleeps and are timing-sensitive.
+cut.
 
 ## Docs
 

@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-#include "engine/engine.h"
+#include "engine/kv_store.h"
 #include "server/resp.h"
 #include "util/logging.h"
 
@@ -19,7 +19,7 @@ namespace kv {
 
 class CommandHandler {
 public:
-    explicit CommandHandler(Engine& engine) : engine_(engine) {}
+    explicit CommandHandler(KVStore& engine) : engine_(engine) {}
 
     RespValue Execute(const std::vector<std::string>& args) {
         if (args.empty()) return RespValue::Error("ERR empty command");
@@ -240,18 +240,53 @@ private:
 
         std::string info = "# Server\r\n"
                            "kv_engine:kernel-v2\r\n"
+                           "role:" + std::string(engine_.is_leader() ? "leader" : "replica") + "\r\n"
                            "io_backend:" + std::string(engine_.backend()->Name()) + "\r\n"
                            "# Keyspace\r\n"
                            "db0:keys=" + std::to_string(keys) + ",expires=0\r\n";
         return RespValue::BulkString(info);
     }
 
+    static std::string HexEncode(std::string_view data) {
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::string out;
+        out.reserve(data.size() * 2);
+        for (unsigned char value : data) {
+            out.push_back(kHex[value >> 4]);
+            out.push_back(kHex[value & 0x0F]);
+        }
+        return out;
+    }
+
+    static bool HexDecode(std::string_view text, std::string* out) {
+        if (text.size() % 2 != 0) return false;
+        auto nibble = [](char value) -> int {
+            if (value >= '0' && value <= '9') return value - '0';
+            if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+            if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+            return -1;
+        };
+        out->clear();
+        out->reserve(text.size() / 2);
+        for (size_t i = 0; i < text.size(); i += 2) {
+            int high = nibble(text[i]);
+            int low = nibble(text[i + 1]);
+            if (high < 0 || low < 0) return false;
+            out->push_back(static_cast<char>((high << 4) | low));
+        }
+        return true;
+    }
+
     RespValue CmdScan(const std::vector<std::string>& args) {
         if (args.size() < 2) return WrongArity("scan");
 
-        uint64_t cursor = 0;
-        if (!ParseU64(args[1], &cursor)) {
-            return RespValue::Error("ERR invalid cursor");
+        std::string start_key;
+        bool inclusive = true;
+        if (args[1] != "0" && !args[1].empty()) {
+            if (!HexDecode(args[1], &start_key)) {
+                return RespValue::Error("ERR invalid cursor");
+            }
+            inclusive = false;
         }
 
         uint64_t count = 10;
@@ -270,34 +305,45 @@ private:
             }
         }
 
-        std::vector<std::string> keys;
-        auto s = engine_.Keys(&keys);
-        if (!s.ok()) return RespValue::Error("ERR " + s.ToString());
-
-        if (cursor >= keys.size()) {
-            return RespValue::Array({
-                RespValue::BulkString("0"),
-                RespValue::Array({}),
-            });
-        }
-
         std::vector<RespValue> found;
-        size_t i = static_cast<size_t>(cursor);
-        while (i < keys.size() && found.size() < count) {
-            if (pattern == "*" || ::fnmatch(pattern.c_str(), keys[i].c_str(), 0) == 0) {
-                found.push_back(RespValue::BulkString(keys[i]));
+        std::string next;
+        bool done = false;
+
+        while (found.size() < count) {
+            std::vector<std::pair<std::string, std::string>> rows;
+            bool batch_done = false;
+            std::string batch_next;
+            auto s = engine_.ScanAfter(start_key, inclusive, count, &rows,
+                                       &batch_done, &batch_next);
+            if (!s.ok()) return RespValue::Error("ERR " + s.ToString());
+
+            for (auto& [key, _] : rows) {
+                if (pattern == "*" || ::fnmatch(pattern.c_str(), key.c_str(), 0) == 0) {
+                    found.push_back(RespValue::BulkString(key));
+                }
             }
-            i++;
+
+            next = std::move(batch_next);
+            if (batch_done) {
+                done = true;
+                break;
+            }
+            if (next.empty()) {
+                done = true;
+                break;
+            }
+            start_key = next;
+            inclusive = false;
         }
 
-        std::string next = (i >= keys.size()) ? "0" : std::to_string(i);
+        std::string cursor = done ? "0" : HexEncode(next);
         return RespValue::Array({
-            RespValue::BulkString(next),
+            RespValue::BulkString(cursor),
             RespValue::Array(std::move(found)),
         });
     }
 
-    Engine& engine_;
+    KVStore& engine_;
 };
 
 } // namespace kv

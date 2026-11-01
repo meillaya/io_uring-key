@@ -219,7 +219,7 @@ def architecture() -> dict:
         Box("mmap", 970, 575, 220, 65, "mmap\nmapped files", "model"),
         Box("uring", 1210, 575, 220, 65, "io_uring\nbatched I/O", "model"),
         Box("data", 1070, 740, 260, 80, "data directory\nwal.log, sst_*.sst", "neutral"),
-        Box("raft", 40, 480, 420, 140, "Raft-lite library\nnot wired into kv_server", "risk"),
+        Box("raft", 40, 480, 420, 140, "Raft mode (optional)\nwrites through the log", "runtime"),
     ]
 
     elements: list[dict] = []
@@ -262,8 +262,8 @@ def architecture() -> dict:
                 40,
                 640,
                 700,
-                "Election, log, snapshots and TCP RPCs exist in src/raft.\n"
-                "The tests exercise the library in process; kv_server never calls it.",
+                "Enable with --raft-id. Writes are leader-only.\n"
+                "Followers reject commands; standalone mode skips the log.",
                 align="left",
             ),
             label(
@@ -277,7 +277,7 @@ def architecture() -> dict:
         ]
     )
 
-    elements.insert(0, title("kv_server reads and writes through one I/O backend"))
+    elements.insert(0, title("kv_server reaches disk through the LSM engine and one I/O backend"))
     return scene(elements)
 
 

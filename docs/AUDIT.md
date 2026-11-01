@@ -16,7 +16,7 @@ server, and Raft findings below.
 At the base commit the build reported 57 of 58 tests passing. The failure was
 the C++23 version check, which expected `__cplusplus >= 202302L`; GCC 13 reports
 `202100L`. After remediation the scaffold test is gone, and the suite passes
-77/77 by default, 78/78 with TLS, and 85/85 with io_uring.
+80/80 by default, 81/81 with TLS, and 88/88 with io_uring.
 
 ## Summary
 
@@ -48,10 +48,10 @@ fix and regression test.
 | 4. Corrupt Raft state | fixed | `LoadState` fails closed and checks bounds. Persistence failures reject votes, proposals, and commits. Corrupt-state test. |
 | 5. Uninitialized Raft replies | fixed | Reply structs are value-initialized and transport status is checked. Failed-transport term test. |
 | 6. Stop hangs on idle client | fixed | Accepted sockets are tracked and shut down in `Stop`. Idle-client test. |
-| 7. Raft not in server | documented | The README and `DESIGN.md` now state that `kv_server` is single-node and Raft is a separate library. |
+| 7. Raft not in server | fixed | `RaftStore` implements the `KVStore` interface, and `kv_server --raft-id` routes writes through the log. A three-node server cluster and failover were exercised manually; the RaftStore restart path has a test. |
 | 8. Dev shell build mismatch | fixed | liburing requirement is 2.14, matching the pinned nixpkgs. Configured with a 2.14 version shim. |
 | 9. Benchmark is not YCSB | fixed | D reads the latest key, E scans 10 keys, F does read-modify-write, and the CSV records `sync_wal`. CSV regenerated. |
-| 10. Redis semantics | fixed | SET options are validated, EX is rejected, NX/XX use one engine lock, MSET writes one batch WAL record, DEL and MGET propagate errors, SELECT parses its index, SCAN is implemented. Command and batch tests. |
+| 10. Redis semantics | fixed | SET options are validated, EX is rejected, NX/XX use one engine lock, MSET writes one batch WAL record, DEL and MGET propagate errors, SELECT parses its index, SCAN uses a merge iterator with an opaque key cursor. Command, batch, and scan tests. |
 | 11. Raft match index | fixed | Follower replies report the last covered index, not its tail. Match-index test. |
 | 12. Snapshot retry loop | fixed | An equal snapshot base returns success. Equal-base test. |
 | 13. RESP line growth | fixed | The parser rejects an unterminated line past 64 KiB and the server caps the connection buffer at 64 MiB. Long-line test. |
@@ -316,7 +316,7 @@ truncating the WAL. Add a test that injects a crash between those steps.
 - The pre-rewrite README titled the project `kernel-v2`, while the repository
   is `io_uring-key` and every binary is named `kv_*`.
 - The pre-rewrite README and the original `DESIGN.md` showed Raft in the
-  server path. The server never starts it.
+  server path. The server now starts it only with `--raft-id`.
 - The pre-rewrite README said all 66 tests were green. The documented dev
   shell could not configure because of the liburing version, and the container
   run had one toolchain failure.
@@ -355,6 +355,6 @@ truncating the WAL. Add a test that injects a crash between those steps.
   idempotent snapshot install.
 - `Bench`: read-latest, scan, read-modify-write, sync policy flag, CSV column.
 - Build: liburing 2.14, sanitizer targets, pinned doctest, GitHub Actions CI.
-- Tests: `tests/test_remediation.cpp`, scaffold test removed, 85 cases with
-  io_uring, 77 in the default build, and 78 with TLS.
+- Tests: `tests/test_remediation.cpp`, scaffold test removed, 88 cases with
+  io_uring, 80 in the default build, and 81 with TLS.
 - Docs: README, `DESIGN.md`, and the figure source label updated.
