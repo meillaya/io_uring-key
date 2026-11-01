@@ -141,19 +141,6 @@ The scan path merges the memtable and SSTables one block at a time, so E stays
 slower than point reads but no longer rebuilds the full key set. Treat the table
 as a smoke benchmark, not a production comparison.
 
-## Layout
-
-| Path | Contents |
-| --- | --- |
-| `src/engine` | LSM engine: get, put, delete, flush, compaction, recovery |
-| `src/wal`, `src/memtable`, `src/sstable`, `src/compaction` | Storage pieces |
-| `src/io` | `IOBackend` interface and four backends |
-| `src/server` | RESP2 parser, command handler, TCP server |
-| `src/raft` | Standalone Raft library and TCP transport |
-| `src/bench`, `tools` | Benchmark harness and chart script |
-| `tests` | doctest suite |
-| `docs` | Audit and figure sources |
-
 ## Tests
 
 `ctest --test-dir build` runs 80 doctest cases in the default build, 81 with
@@ -172,7 +159,6 @@ cut.
 
 ## Docs
 
-- [DESIGN.md](DESIGN.md): design notes and the backend contract.
 - [docs/AUDIT.md](docs/AUDIT.md): the original findings and their remediation.
 - [docs/figures/README.md](docs/figures/README.md): figure source and render
   command.

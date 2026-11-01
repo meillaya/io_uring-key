@@ -357,4 +357,4 @@ truncating the WAL. Add a test that injects a crash between those steps.
 - Build: liburing 2.14, sanitizer targets, pinned doctest, GitHub Actions CI.
 - Tests: `tests/test_remediation.cpp`, scaffold test removed, 88 cases with
   io_uring, 80 in the default build, and 81 with TLS.
-- Docs: README, `DESIGN.md`, and the figure source label updated.
+- Docs: README and the figure source label updated. `DESIGN.md` was removed.
