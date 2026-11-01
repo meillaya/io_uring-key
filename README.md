@@ -1,230 +1,145 @@
-# kernel-v2
+<h1 align="center" style="letter-spacing: 0.12em;">io_uring-key</h1>
 
-A log-structured key-value store in C++23 with a pluggable I/O backend layer
-(including an io_uring backend), a Redis-compatible RESP2 API, YCSB benchmarks,
-and a Raft-lite replication layer with a persistent log, snapshots, and a real
-TCP transport.
+<p align="center">A C++23 log-structured key-value store with a RESP2 server, four I/O backends, and a standalone Raft library.</p>
 
-> **Honesty note.** This README describes exactly what the code does today.
-> Features that are partial, stubbed, or future work are called out explicitly
-> in [Limitations / future work](#limitations--future-work).
+<br>
 
-## Architecture
+## What this is
 
-```
-┌─────────────────────────────────────────────────┐
-│        Redis RESP2 Server (src/server)          │
-│   TCP, thread-per-connection, hardened parser   │
-├─────────────────────────────────────────────────┤
-│        Raft-lite Replication (src/raft)         │
-│  election · log replication · persistent log +  │
-│  snapshots · TCP transport (POSIX sockets)      │
-├─────────────────────────────────────────────────┤
-│              KV Engine (src/engine)             │
-├──────────┬──────────┬───────────┬───────────────┤
-│   WAL    │ Memtable │  SSTable  │  Compaction   │
-│ (src/wal)│(src/mem) │(src/sst)  │(src/compaction)│
-├──────────┴──────────┴───────────┴───────────────┤
-│        I/O Backend Interface (FROZEN, src/io)   │
-├──────────┬──────────┬───────────┬───────────────┤
-│  sync    │threadpool│   mmap    │   io_uring    │
-│ pread/   │std::thread│ mmap'd   │ batched submit│
-│ pwrite   │  pool    │ segments │ +reg buf/files│
-│ +fsync   │          │          │ +SQPOLL(opt)  │
-└──────────┴──────────┴───────────┴───────────────┘
-```
+`kv_server` is a single-process key-value server. It speaks RESP2 over TCP and
+stores data in an LSM tree: a write-ahead log, a skip-list memtable, block-based
+SSTables, and size-tiered compaction. Four backends implement one I/O interface:
+`sync`, `threadpool`, `mmap`, and `io_uring`.
 
-There is **no** separate io_uring network reactor. The RESP server and the Raft
-TCP transport both use plain POSIX sockets directly (the server is
-thread-per-connection; Raft uses short-lived request/reply connections).
+The repository also contains a Raft consensus library, a YCSB-style benchmark
+harness, and a chart script. The server does not start the Raft library. The
+source and runtime messages use the internal name `kernel-v2`.
 
-## Features (as implemented)
-
-- **LSM-tree storage engine**: append-only WAL with per-record CRC, group
-  commit, replay and torn-write detection; concurrent skip-list memtable;
-  SSTables with a block format, sparse index, bloom filter and footer;
-  size-tiered compaction **wired into the flush path** (triggers when the
-  level-0 SSTable count reaches the compaction threshold).
-- **Four interchangeable I/O backends**, benchmarked head-to-head:
-  - `sync` — pread/pwrite + fsync (baseline).
-  - `threadpool` — std::thread pool dispatching the same synchronous ops.
-  - `mmap` — memory-mapped segment files.
-  - `io_uring` — liburing 2.15: batched `SubmitBatch`, registered buffers
-    (`IORING_REGISTER_BUFFERS`) and registered files (`IORING_REGISTER_FILES`),
-    `IORING_SETUP_SQPOLL` **attempted by default with graceful fallback**, and
-    O_DIRECT-aware opens. Registered-buffer `prep_read_fixed`/`prep_write_fixed`
-    are used when a caller passes one of the backend's pool buffers.
-- **Redis-compatible RESP2 API** over TCP: `PING`, `ECHO`, `GET`, `SET`
-  (`NX`/`XX` honored; `EX` is parsed but **not enforced** — no TTL/expiry),
-  `DEL`, `EXISTS`, `MGET`, `MSET`, `DBSIZE` (real live-key count), `FLUSHDB`
-  (real: clears the memtable, deletes all SSTables, truncates the WAL),
-  `INFO`, `SELECT` (single DB, always OK), `COMMAND`, and a **minimal `SCAN`
-  stub** (returns cursor 0 and an empty list). The parser is hardened:
-  malformed input (bad integers, oversized bulk/array lengths, garbage type
-  bytes) yields a `-ERR` reply and never crashes the server.
-- **Raft-lite replication**:
-  - Leader election and log replication with a KV state machine.
-  - **Persistent state**: `currentTerm`, `votedFor`, `commitIndex`, the log,
-    and the latest snapshot are persisted to `<data_dir>/raft_state.bin`
-    (CRC-checked, atomic tmp+rename). On restart the committed log is replayed
-    through the apply callback to rebuild state.
-  - **Snapshots**: log compaction into a snapshot with log truncation
-    (`TakeSnapshot`), plus an `InstallSnapshot` RPC so a leader can fast-forward
-    a follower that is behind the compacted log.
-  - **Leader-only reads**: the leader serves reads from its state machine.
-    This is a leader-lease-style approach (the leader serves reads because it
-    believes it is leader); it is **not** a full ReadIndex heartbeat-confirm.
-  - **Two transports**: a deterministic in-memory transport (unit tests) and a
-    **real TCP transport over POSIX sockets** (`src/raft/tcp_transport.h`),
-    exercised by an in-process 3-node localhost cluster test that covers
-    election, replication, and failover after killing the leader.
-- **YCSB A–F benchmark suite** with p50/p95/p99 latency histograms, CSV export,
-  and `tools/charts.py` (matplotlib) that renders per-workload p50/p95/p99
-  latency charts (overall/read/write) plus a throughput chart.
-- **Engine crash-recovery** verified via SIGKILL during writes plus WAL CRC
-  torn-write detection, all in isolated `mktemp` data dirs.
-
-## Quick Start
-
-```bash
-# Enter dev environment
-devenv shell   # or: nix develop
-
-# Build
-cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build -j
-
-# Test (66 tests)
-ctest --test-dir build --output-on-failure
-
-# Run server
-./build/kv_server --port 6379 --backend sync --data-dir /tmp/kv_data
-
-# Run benchmark (writes benchmark_results.csv)
-./build/kv_bench --keys 1000 --ops 5000 --output benchmark_results.csv
-
-# Generate charts (requires matplotlib: pip install matplotlib)
-python3 tools/charts.py --input benchmark_results.csv --output charts/
-```
+This is a research prototype for systems programmers. It has known
+correctness gaps. Read [Limits](#limits) before you trust it with data.
 
 ## Requirements
 
-- Linux kernel with io_uring (developed/tested on 7.1). The io_uring backend
-  degrades gracefully (SQPOLL fallback) where features are unavailable.
-- liburing ≥ 2.15 (system package).
-- GCC ≥ 16 or Clang ≥ 22 (C++23).
-- CMake ≥ 3.28.
-- Python 3 + matplotlib (for charts only — not a runtime dependency).
+The dev shell supplies liburing 2.14, GCC 16, Clang 22, CMake 4.1, Python 3, and
+matplotlib. Without Nix you need Linux with io_uring, liburing 2.14 or newer,
+CMake 3.28 or newer, and GCC 16 or Clang 22.
 
-## Benchmark Results
+## Quick start
 
-`./build/kv_bench --keys 1000 --ops 5000` on the dev host (kernel 7.1). Average
-throughput across YCSB A–F:
+Linux only. The flake has dev shells for `x86_64-linux` and `aarch64-linux`;
+there is no macOS dev shell.
 
-| backend    | avg ops/sec | vs sync |
-|------------|-------------|---------|
-| sync       | ~286k       | 1.00x   |
-| mmap       | ~262k       | 0.91x   |
-| io_uring   | ~217k       | 0.76x   |
-| threadpool | ~197k       | 0.69x   |
+```bash
+nix develop
+cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
 
-**Reading these numbers honestly:** at this tiny, fully cached scale with
-synchronous per-operation submission and an fsync per write, plain `pread`/
-`pwrite` (the `sync` backend) is the fastest. The io_uring backend enables
-SQPOLL and registers buffers/files, and it **beats sync on the read-only
-workload C** (~506k vs ~390k, ~1.30x) where there is no per-write fsync, but it
-trails on write-heavy workloads because the engine's hot path still submits one
-I/O at a time and waits. io_uring's structural advantage appears at higher
-queue depths, larger I/O, and genuinely batched/async submission — see
-[Limitations](#limitations--future-work).
+Start the server in one terminal:
 
-Apples-to-apples contract: ONE engine, ONE memtable/SSTable/WAL/format/durability
-policy. The four backends differ ONLY in the I/O submission/completion path.
+```bash
+./build/kv_server --port 6379 --backend sync --data-dir /tmp/kv_data
+```
 
-## Test Coverage
+Use the Redis CLI that the dev shell provides:
 
-66 ctest cases, all green (`ctest --test-dir build`). Highlights:
+```bash
+redis-cli -p 6379 SET hello world
+redis-cli -p 6379 GET hello
+```
 
-| Category | Coverage |
-|----------|----------|
-| Util | Status, CRC32, AlignedBuffer, histogram |
-| WAL | append, replay, torn-write, CRC, group commit, truncate |
-| Engine differential | randomized ops vs `std::map` |
-| Crash recovery | SIGKILL during writes / after flush |
-| io_uring | init, differential, recovery, batch, alignment, buffered, registered-buffer fast path |
-| Backends | differential across sync/threadpool/mmap/io_uring |
-| RESP2 | parse/serialize/roundtrip + **malformed-input hardening** |
-| Server | **malformed RESP over a real socket never crashes the server** |
-| Engine features | **FLUSHDB/Clear, DBSIZE, compaction wiring, corruption detection** |
-| Concurrency | **readers vs flush memtable-swap soak (TSan-clean)** |
-| Raft | election, replication, leader-only reads, **persistent-log restart recovery, snapshot + restart, InstallSnapshot + snapshot-base safety** (Raft layer TSan-clean) |
-| Raft TCP | **3-node localhost cluster: election, replication, failover over real TCP** |
+Run the benchmark and render its charts:
 
-## Module Layout
+```bash
+./build/kv_bench --keys 1000 --ops 5000 --output benchmark_results.csv
+python3 tools/charts.py --input benchmark_results.csv --output charts/
+```
 
-| Module | Path | Description |
-|--------|------|-------------|
-| util | `src/util/` | Aligned buffers, CRC32C, Status, histogram, logging |
-| wal | `src/wal/` | Write-ahead log: group commit, CRC, replay, torn-write |
-| memtable | `src/memtable/` | Concurrent skip list |
-| sstable | `src/sstable/` | Sorted runs, sparse index, bloom filter, blocks |
-| compaction | `src/compaction/` | Size-tiered compaction |
-| io | `src/io/` | I/O backend interface (FROZEN) + 4 implementations |
-| engine | `src/engine/` | LSM engine: Get/Put/Delete, flush, compaction, recovery |
-| server | `src/server/` | RESP2 protocol + hardened parser + TCP server |
-| raft | `src/raft/` | Raft-lite: election, replication, persistent log, snapshots, TCP transport |
-| bench | `src/bench/` | YCSB workload generator + latency capture + CSV |
-| tools | `tools/` | `charts.py` (matplotlib charts from benchmark CSV) |
+## Architecture
 
-## Limitations / future work
+![Architecture](docs/figures/architecture.png)
 
-Stated plainly so the docs never overclaim:
+`kv_server` reads and writes through the LSM engine and one I/O backend. The
+Raft code is a separate library in `src/raft`; the server never starts it. The
+figure source and render command are in
+[docs/figures/README.md](docs/figures/README.md).
 
-- **io_uring performance at tiny cached scale.** With 1k keys / 5k cached ops
-  and synchronous one-op-at-a-time submission + per-write fsync, io_uring is
-  ~0.76x of `sync` on average (faster only on read-only workload C). The
-  registered-buffer fast path exists but the engine's point-lookup path passes
-  caller-owned buffers, so it does not currently route through
-  `prep_read_fixed`. Winning here would require batching multiple I/Os per
-  submission and/or routing the read/flush path through registered pool buffers
-  at higher queue depth — future work.
-- **No io_uring network reactor.** Networking (RESP server and Raft transport)
-  uses plain POSIX sockets, not multishot io_uring accept/recv/send.
-- **Raft transport is real TCP but tested in-process.** `TcpRaftTransport`
-  speaks real TCP over localhost and is tested with 3 in-process nodes
-  (election, replication, failover). A separate multi-OS-process cluster binary
-  / harness is future work.
-- **In-memory Raft test transport can ABBA-deadlock under load.** The
-  in-memory test transport invokes peer RPC handlers inline (synchronously,
-  on the caller's thread), so two nodes running concurrent elections can
-  ABBA-deadlock under heavy CPU load — a liveness flake in tests, not a
-  safety bug (term/vote rules are unaffected). The TCP transport is
-  structurally immune because it dispatches each inbound RPC on its own
-  thread.
-- **Raft reads are leader-lease-style, not full ReadIndex.** The leader serves
-  reads from its state machine without a ReadIndex heartbeat-confirm round.
-  Follower reads are out of scope.
-- **No dynamic Raft membership** (joint consensus) — stretch only.
-- **Raft persisted state is fsync-durable (file + directory).** `PersistState`
-  fsyncs the temp `raft_state.bin` before the atomic rename and fsyncs the
-  containing directory after, so `currentTerm`/`votedFor`/log/snapshot survive
-  power loss (closing the renamed-but-not-fsync'd double-vote window). Residual
-  caveat: this is only as durable as the underlying storage/filesystem honoring
-  `fsync` — a disk write-cache with barriers disabled, or a filesystem that
-  no-ops `fsync`, can still lose acknowledged writes. The engine's WAL/SSTable
-  durability is governed separately by the I/O backend's `sync_wal` policy.
-- **RESP `SET ... EX` TTL is parsed but not enforced** (no key expiry).
-  **`SCAN` is a minimal stub** (returns cursor 0 + empty list). `SELECT` is a
-  single-DB no-op.
-- **`SET ... NX`/`XX` is best-effort, not atomic.** The handler checks existence
-  (`GET`) then writes (`PUT`) as two separate engine calls with no cross-operation
-  lock, so concurrent conditional SETs on the same key can race (two clients may
-  both observe "absent" and both succeed). The engine exposes no atomic
-  put-if-absent / compare-and-set primitive to collapse this into one transactional
-  step; atomic conditional SET is future work.
-- **Production hardening** (TLS/auth/ACL, rate limiting, multi-tenancy) is out
-  of scope.
+## What works
 
-## License
+- LSM engine: CRC-checked WAL, skip-list memtable, block SSTables with sparse
+  indexes and bloom filters, and size-tiered compaction.
+- I/O backends: `sync`, `threadpool`, `mmap`, and `io_uring`. The io_uring
+  backend supports batched submission, registered buffers and files, and
+  optional SQPOLL with a fallback. The engine still submits one operation at a
+  time on its hot path.
+- RESP2 server: `PING`, `ECHO`, `GET`, `SET`, `DEL`, `EXISTS`, `MGET`, `MSET`,
+  `DBSIZE`, `FLUSHDB`, `INFO`, `SELECT`, `COMMAND`, and a stub `SCAN`.
+- Raft library: elections, log replication, a persistent log, snapshots, and a
+  TCP transport. Unit and in-process cluster tests cover it.
+- Benchmarks: a YCSB-style A to F generator, p50/p95/p99 capture, CSV export,
+  and matplotlib charts.
 
-MIT
+## Limits
+
+- A torn WAL tail is never truncated. Writes accepted after recovery can be
+  lost on the next restart. Mixed-size compaction can return stale values, and
+  a corrupt bloom filter can crash reads. [docs/AUDIT.md](docs/AUDIT.md) gives
+  each one a repro.
+- `SET ... EX` parses a TTL and does not enforce it. `SCAN` returns an empty
+  list. `SELECT` ignores its argument.
+- `SET NX/XX`, `MSET`, and `DEL` are not atomic. `MSET` ignores write failures.
+- The Raft library is not part of the server. The leader serves reads without a
+  ReadIndex confirmation.
+- `Server::Stop()` can block on an idle client. There is no TLS, auth, or
+  connection limit.
+- Networking uses POSIX sockets. There is no io_uring network reactor.
+
+## Benchmarks
+
+`./build/kv_bench --keys 1000 --ops 5000` on the development host. The table is
+the unweighted mean of the six per-workload throughputs in
+`benchmark_results.csv`.
+
+| Backend | Mean ops/s | vs sync |
+| --- | ---: | ---: |
+| `sync` | 286k | 1.00x |
+| `mmap` | 262k | 0.91x |
+| `io_uring` | 217k | 0.76x |
+| `threadpool` | 197k | 0.69x |
+
+The harness sets `sync_wal = false`, so writes do not fsync the WAL. Workloads
+B, D, and E use the same 95/5 uniform point-read mix; E does not scan. Treat the
+table as a smoke benchmark, not a YCSB result. io_uring is fastest on read-only
+workload C, at 506k against 390k for sync.
+
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `src/engine` | LSM engine: get, put, delete, flush, compaction, recovery |
+| `src/wal`, `src/memtable`, `src/sstable`, `src/compaction` | Storage pieces |
+| `src/io` | `IOBackend` interface and four backends |
+| `src/server` | RESP2 parser, command handler, TCP server |
+| `src/raft` | Standalone Raft library and TCP transport |
+| `src/bench`, `tools` | Benchmark harness and chart script |
+| `tests` | doctest suite |
+| `docs` | Audit and figure sources |
+
+## Tests
+
+`ctest --test-dir build` runs 66 doctest cases with the io_uring backend enabled,
+and 58 without it. The suite covers WAL replay, randomized engine operations
+against `std::map`, crash recovery with SIGKILL, RESP parsing, malformed socket
+input, compaction, concurrent readers, Raft persistence and snapshots, and a
+three-node TCP cluster.
+
+The crash tests use SIGKILL, which does not test power loss. The Raft tests use
+sleeps and are timing-sensitive.
+
+## Docs
+
+- [DESIGN.md](DESIGN.md): design notes and the backend contract.
+- [docs/AUDIT.md](docs/AUDIT.md): findings with severity and repros.
+- [docs/figures/README.md](docs/figures/README.md): figure source and render
+  command.

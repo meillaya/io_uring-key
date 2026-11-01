@@ -1,4 +1,8 @@
-# kernel-v2 — Design Document
+# kernel-v2 design document
+
+> Status: implementation notes from G0 to G8. The server does not start the
+> Raft library, and the benchmark disables WAL fsync. See
+> [docs/AUDIT.md](docs/AUDIT.md) for open correctness gaps.
 
 ## Overview
 
@@ -6,8 +10,9 @@ A log-structured key-value store in C++23 with:
 - WAL + skip-list memtable + SSTables + size-tiered compaction (LSM-tree).
 - Four interchangeable I/O backends (sync, threadpool, mmap, io_uring).
 - Redis-compatible RESP2 API over TCP (hardened parser).
-- Raft-lite replication: election, log replication, **persistent log +
-  snapshots**, and a **real TCP transport** (POSIX sockets).
+- Raft library (standalone, not used by the server): election, log
+  replication, **persistent log + snapshots**, and a **real TCP transport**
+  (POSIX sockets).
 
 This document describes the implemented system. Partial/stubbed areas are
 labeled explicitly.
@@ -35,7 +40,8 @@ labeled explicitly.
 ```
 
 There is **no** `src/net` io_uring network reactor. Both the RESP server and
-the Raft TCP transport use plain POSIX sockets directly.
+the Raft TCP transport use plain POSIX sockets directly. The Raft row is a
+library, not part of the server path. `kv_server` never starts it.
 
 ## Module Layout
 
@@ -58,9 +64,9 @@ the Raft TCP transport use plain POSIX sockets directly.
 same interface; the engine/WAL/SSTable layers only touch I/O through it.
 
 Interface methods:
-- `Open/Close/Delete/FileSize` — file lifecycle.
-- `Read/Write/Append/Sync` — synchronous I/O.
-- `SubmitBatch` — batched I/O (default: synchronous fallback; io_uring overrides
+- `Open/Close/Delete/FileSize`: file lifecycle.
+- `Read/Write/Append/Sync`: synchronous I/O.
+- `SubmitBatch`: batched I/O (default: synchronous fallback; io_uring overrides
   with true batched submission).
 - Capability queries: `SupportsDirectIO/BatchedIO/RegisteredBuffers/FixedFiles`.
 
@@ -81,8 +87,9 @@ differ ONLY in the I/O submission/completion path.
 
 Held constant: memtable (concurrent skip list), SSTable format (block-based,
 sparse index, bloom filter), WAL format (append-only, per-record CRC),
-compaction policy (size-tiered), durability policy (fsync on WAL commit), and
-the YCSB A–F key/value distribution.
+compaction policy (size-tiered), durability policy (WAL fsync on commit in
+server mode, disabled for the benchmark), and the YCSB-style A to F key/value
+distribution.
 
 ## LSM Engine
 
@@ -157,7 +164,7 @@ as a limitation rather than a full linearizable-read implementation.
 - [x] G3: Backends + YCSB bench + charts (charts.py implemented).
 - [x] G4: Redis RESP2 API over TCP (POSIX sockets; hardened parser). No io_uring
       net reactor (see Limitations).
-- [x] G5: Raft-lite — election, replication, persistent log + snapshots,
+- [x] G5: Raft-lite: election, replication, persistent log + snapshots,
       InstallSnapshot, restart recovery, real TCP transport (tested in-process).
 - [x] G6: Hardening, docs reconciled with reality, final benchmark report.
 - [x] G8: Code-review blockers resolved (RESP hardening, memtable race, FLUSHDB,

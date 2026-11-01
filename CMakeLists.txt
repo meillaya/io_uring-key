@@ -13,7 +13,7 @@ option(KV_USE_IOURING "Enable io_uring backend" ON)
 
 if(KV_USE_IOURING)
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.15)
+  pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.14)
 endif()
 
 include(FetchContent)

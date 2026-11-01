@@ -16,6 +16,9 @@ __pycache__/
 *.pyc
 *.png
 
+# Figure sources and renders are tracked.
+!docs/figures/*.png
+
 # Editor
 *.swp
 *.swo
